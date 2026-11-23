@@ -502,8 +502,10 @@ func PipeStdioToProxy(ctx context.Context, hubURL, token, nodeID string, cfHeade
 }
 
 // GenerateServiceFile returns OS-native background service unit contents and target file path.
+// It delegates runtime configuration to `config.json` (`0600`) so tokens and CF secrets never appear in `ps aux`.
 func GenerateServiceFile(goos, binPath, hubURL, token, nodeID, nodeName string, sshPort int) (targetPath string, content string, hint string, err error) {
 	home, _ := os.UserHomeDir()
+	_, _, _, _ = hubURL, token, nodeID, sshPort
 	switch goos {
 	case "linux":
 		targetPath = filepath.Join(home, ".config", "systemd", "user", "ssh-fleet-agent.service")
@@ -513,13 +515,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart="%s" agent --hub "%s" --token "%s" --node-id "%s" --name "%s" --ssh-port %d
+ExecStart="%s" agent
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=default.target
-`, nodeName, binPath, hubURL, token, nodeID, nodeName, sshPort)
+`, nodeName, binPath)
 		hint = "systemctl --user daemon-reload && systemctl --user enable --now ssh-fleet-agent"
 		return targetPath, content, hint, nil
 	case "darwin":
@@ -533,17 +535,12 @@ WantedBy=default.target
   <array>
     <string>%s</string>
     <string>agent</string>
-    <string>--hub</string><string>%s</string>
-    <string>--token</string><string>%s</string>
-    <string>--node-id</string><string>%s</string>
-    <string>--name</string><string>%s</string>
-    <string>--ssh-port</string><string>%d</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict>
 </plist>
-`, binPath, hubURL, token, nodeID, nodeName, sshPort)
+`, binPath)
 		hint = "launchctl load -w " + targetPath
 		return targetPath, content, hint, nil
 	case "windows":
@@ -552,7 +549,7 @@ WantedBy=default.target
 			appData = filepath.Join(home, "AppData", "Roaming")
 		}
 		targetPath = filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "ssh-fleet-agent.vbs")
-		cmdLine := fmt.Sprintf(`\"%s\" agent --hub \"%s\" --token \"%s\" --node-id \"%s\" --name \"%s\" --ssh-port %d`, binPath, hubURL, token, nodeID, nodeName, sshPort)
+		cmdLine := fmt.Sprintf(`\"%s\" agent`, binPath)
 		content = fmt.Sprintf("Set WshShell = CreateObject(\"WScript.Shell\")\r\nWshShell.Run \"%s\", 0, False\r\n", cmdLine)
 		hint = "Double-click or reboot to start automatically via Windows Startup folder"
 		return targetPath, content, hint, nil

@@ -22,10 +22,13 @@ Write-Host "Installed sf.exe -> $Target"
 
 if ($env:SF_HUB -and $env:SF_TOKEN) {
     $joinArgs = @("join", $env:SF_HUB, $env:SF_TOKEN)
+    if ($env:SF_CF_CLIENT_ID -and $env:SF_CF_CLIENT_SECRET) {
+        $joinArgs += @("--cf-client-id", $env:SF_CF_CLIENT_ID, "--cf-client-secret", $env:SF_CF_CLIENT_SECRET)
+    }
     if ($env:SF_NAME) {
         $joinArgs += @("--name", $env:SF_NAME)
     }
     & $Target @joinArgs
 } else {
-    Write-Host "Run: sf.exe join <HUB_URL> <TOKEN> [--name DEVICE_NAME]"
+    Write-Host "Run: sf.exe join <HUB_URL> <TOKEN> [--cf-client-id ID --cf-client-secret SECRET] [--name DEVICE_NAME]"
 }

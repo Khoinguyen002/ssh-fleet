@@ -1148,6 +1148,8 @@ func cmdJoin(args []string) error {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
 	hubFlag := fs.String("hub", "", "Hub URL")
 	tokenFlag := fs.String("token", "", "Hub Bearer token")
+	cfIDFlag := fs.String("cf-client-id", os.Getenv("SF_CF_CLIENT_ID"), "Cloudflare Access Service Token Client ID")
+	cfSecretFlag := fs.String("cf-client-secret", os.Getenv("SF_CF_CLIENT_SECRET"), "Cloudflare Access Service Token Client Secret")
 	nameFlag := fs.String("name", cfg.AgentName, "Device display name")
 	nodeIDFlag := fs.String("node-id", cfg.NodeID, "Unique node ID")
 	sshPortFlag := fs.Int("ssh-port", cfg.SSHPort, "Local SSH daemon port")
@@ -1170,11 +1172,17 @@ func cmdJoin(args []string) error {
 	}
 
 	if strings.TrimSpace(hubURL) == "" || strings.TrimSpace(token) == "" {
-		return errors.New("usage: sf join <hub-url> <token> [--name DEVICE_NAME] [--ssh-port 22] [--no-agent]")
+		return errors.New("usage: sf join <hub-url> <token> [--cf-client-id ID --cf-client-secret SECRET] [--name DEVICE_NAME] [--ssh-port 22] [--no-agent]")
 	}
 
 	cfg.HubURL = strings.TrimRight(hubURL, "/")
 	cfg.HubToken = token
+	if *cfIDFlag != "" {
+		cfg.CFClientID = *cfIDFlag
+	}
+	if *cfSecretFlag != "" {
+		cfg.CFClientSecret = *cfSecretFlag
+	}
 	if *nameFlag != "" {
 		cfg.AgentName = *nameFlag
 	}
@@ -1256,12 +1264,10 @@ func installAndStartAgent(selfBin string, cfg vault.LocalConfig) (string, error)
 	case "linux":
 		_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
 		if err := exec.Command("systemctl", "--user", "enable", "--now", "ssh-fleet-agent").Run(); err == nil {
+			_ = exec.Command("systemctl", "--user", "restart", "ssh-fleet-agent").Run()
 			return "systemd user service (" + targetPath + ")", nil
 		}
-		logPath, err := startDetachedProcess(selfBin, []string{
-			"agent", "--hub", cfg.HubURL, "--token", cfg.HubToken,
-			"--node-id", cfg.NodeID, "--name", cfg.AgentName, "--ssh-port", strconv.Itoa(cfg.SSHPort),
-		}, "agent.log")
+		logPath, err := startDetachedProcess(selfBin, []string{"agent"}, "agent.log")
 		if err != nil {
 			return "", fmt.Errorf("systemd --user failed and fallback failed (%v). Manual: %s", err, hint)
 		}
@@ -1271,10 +1277,7 @@ func installAndStartAgent(selfBin string, cfg vault.LocalConfig) (string, error)
 		if err := exec.Command("launchctl", "load", "-w", targetPath).Run(); err == nil {
 			return "LaunchAgent (" + targetPath + ")", nil
 		}
-		logPath, err := startDetachedProcess(selfBin, []string{
-			"agent", "--hub", cfg.HubURL, "--token", cfg.HubToken,
-			"--node-id", cfg.NodeID, "--name", cfg.AgentName, "--ssh-port", strconv.Itoa(cfg.SSHPort),
-		}, "agent.log")
+		logPath, err := startDetachedProcess(selfBin, []string{"agent"}, "agent.log")
 		if err != nil {
 			return "", err
 		}
@@ -1369,6 +1372,14 @@ func cmdAgent(args []string) error {
 		if err := os.WriteFile(targetPath, []byte(content), 0644); err != nil {
 			return err
 		}
+		cfg.HubURL = strings.TrimRight(*hubURL, "/")
+		cfg.HubToken = *token
+		cfg.CFClientID = *cfID
+		cfg.CFClientSecret = *cfSecret
+		cfg.NodeID = *nodeID
+		cfg.AgentName = *name
+		cfg.SSHPort = *sshPort
+		_ = vault.SaveConfig(configPath(), cfg)
 		fmt.Printf("Wrote service file: %s\nNext step: %s\n", targetPath, hint)
 		return nil
 	}
