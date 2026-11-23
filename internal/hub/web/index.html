@@ -156,6 +156,34 @@
       padding: 10px 16px; border-radius: 10px; font-size: 13px; z-index: 80;
       display: none; max-width: 90vw;
     }
+    .code-box {
+      background: #070a12;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #cbd5e1;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      user-select: all;
+    }
+    .script-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .script-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
   </style>
 </head>
 <body>
@@ -164,7 +192,8 @@
       <span>⚡ SSH Fleet</span>
       <span id="authBadge" class="badge">Checking auth...</span>
     </div>
-    <div style="display:flex; gap:8px; align-items:center;">
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <button id="connectBtn" class="primary" onclick="toggleConnectPanel()" style="display:none;">➕ Connect Device</button>
       <button id="vaultBtn" onclick="openVaultModal()">🔐 Unlock Vault</button>
       <button onclick="refreshAll()">↻ Refresh</button>
     </div>
@@ -179,6 +208,30 @@
       <div style="display:flex; gap:8px; flex:1; max-width:420px;">
         <input id="tokenInput" type="password" placeholder="sf_... Hub token" />
         <button class="primary" onclick="loginWithToken()">Login</button>
+      </div>
+    </div>
+
+    <div id="connectPanel" class="card" style="display:none; margin-bottom:14px;">
+      <div class="card-head">
+        <div>
+          <div class="card-title">➕ Connect New Device (1-Line Setup)</div>
+          <div class="card-sub">The Hub token is masked on screen and automatically injected into your clipboard on copy. Replace <code>&lt;CF_CLIENT_ID&gt;</code> &amp; <code>&lt;CF_CLIENT_SECRET&gt;</code> with your Cloudflare Access Service Token.</div>
+        </div>
+        <button onclick="toggleConnectPanel(false)">✕</button>
+      </div>
+      <div class="script-row">
+        <div class="script-head">
+          <span>Linux / macOS / Termux</span>
+          <button onclick="copyJoinScript('unix')">📋 Copy Command</button>
+        </div>
+        <div id="unixScriptBox" class="code-box"></div>
+      </div>
+      <div class="script-row">
+        <div class="script-head">
+          <span>Windows (PowerShell)</span>
+          <button onclick="copyJoinScript('win')">📋 Copy Command</button>
+        </div>
+        <div id="winScriptBox" class="code-box"></div>
       </div>
     </div>
 
@@ -241,6 +294,8 @@
     let hubNodes = [];
     let vaultData = null;
     let bearerToken = localStorage.getItem('sf_token') || '';
+    let realHubToken = '';
+    let redactedHubToken = 'sf_••••';
     let activeWS = null;
     let term = null;
     let fitAddon = null;
@@ -307,21 +362,88 @@
 
     async function refreshAll() {
       const ok = await checkAuth();
+      document.getElementById('connectBtn').style.display = ok ? 'inline-block' : 'none';
       if (!ok) {
         hubNodes = [];
+        realHubToken = '';
+        document.getElementById('connectPanel').style.display = 'none';
         renderFleet();
         return;
       }
       try {
-        const res = await fetch('/api/v1/nodes', { headers: authHeaders(), credentials: 'include' });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
+        const [nodesRes, infoRes] = await Promise.all([
+          fetch('/api/v1/nodes', { headers: authHeaders(), credentials: 'include' }),
+          fetch('/api/v1/hub-info', { headers: authHeaders(), credentials: 'include' })
+        ]);
+        if (!nodesRes.ok) throw new Error('HTTP ' + nodesRes.status);
+        const data = await nodesRes.json();
         hubNodes = data.nodes || [];
+        if (infoRes.ok) {
+          const info = await infoRes.json();
+          realHubToken = info.hub_token || '';
+          redactedHubToken = info.hub_token_redacted || 'sf_••••';
+          renderConnectScripts();
+        }
       } catch (e) {
         showToast('Failed to fetch nodes: ' + e.message);
       }
       renderFleet();
     }
+
+    function buildJoinScript(kind, tokenVal) {
+      const hubOrigin = location.origin;
+      if (kind === 'win') {
+        return `$env:SF_HUB="${hubOrigin}"; $env:SF_TOKEN="${tokenVal}"; $env:SF_CF_CLIENT_ID="<CF_CLIENT_ID>"; $env:SF_CF_CLIENT_SECRET="<CF_CLIENT_SECRET>"; irm https://raw.githubusercontent.com/Khoinguyen002/ssh-fleet/main/install.ps1 | iex`;
+      }
+      return `curl -fsSL https://raw.githubusercontent.com/Khoinguyen002/ssh-fleet/main/install.sh | bash -s -- join ${hubOrigin} ${tokenVal} --cf-client-id <CF_CLIENT_ID> --cf-client-secret <CF_CLIENT_SECRET>`;
+    }
+
+    function renderConnectScripts() {
+      document.getElementById('unixScriptBox').textContent = buildJoinScript('unix', redactedHubToken);
+      document.getElementById('winScriptBox').textContent = buildJoinScript('win', redactedHubToken);
+    }
+
+    function toggleConnectPanel(force) {
+      const panel = document.getElementById('connectPanel');
+      const show = typeof force === 'boolean' ? force : panel.style.display === 'none';
+      panel.style.display = show ? 'flex' : 'none';
+      if (show) renderConnectScripts();
+    }
+
+    async function copyJoinScript(kind) {
+      const tok = realHubToken || redactedHubToken;
+      const text = buildJoinScript(kind, tok);
+      try {
+        await navigator.clipboard.writeText(text);
+        showToast('Copied! Hub token injected — replace <CF_CLIENT_ID> & <CF_CLIENT_SECRET>.');
+      } catch {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast('Copied! Hub token injected — replace <CF_CLIENT_ID> & <CF_CLIENT_SECRET>.');
+      }
+    }
+
+    ['unixScriptBox', 'winScriptBox'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener('copy', (e) => {
+        if (!realHubToken) return;
+        const kind = id === 'winScriptBox' ? 'win' : 'unix';
+        const sel = window.getSelection ? window.getSelection().toString() : '';
+        const textToCopy = sel ? sel.replace(redactedHubToken, realHubToken) : buildJoinScript(kind, realHubToken);
+        if (e.clipboardData) {
+          e.preventDefault();
+          e.clipboardData.setData('text/plain', textToCopy);
+          showToast('Copied with real hub_token injected!');
+        }
+      });
+    });
 
     function openVaultModal() {
       document.getElementById('vaultModal').classList.add('open');

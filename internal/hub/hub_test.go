@@ -365,6 +365,30 @@ func TestCloudflareAccessAuthAndWebSocketTerminal(t *testing.T) {
 		t.Fatalf("expected CF Access authenticated as khoi@example.com, got %+v", stAllow)
 	}
 
+	// 3b. Verify /api/v1/hub-info rejects unauthenticated and returns redacted + full token when authenticated
+	infoUnauth, err := http.Get(ts.URL + "/api/v1/hub-info")
+	if err != nil || infoUnauth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauth /api/v1/hub-info, got err=%v resp=%v", err, infoUnauth)
+	}
+	_ = infoUnauth.Body.Close()
+
+	reqInfo, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/hub-info", nil)
+	reqInfo.Header.Set("Cf-Access-Authenticated-User-Email", "khoi@example.com")
+	respInfo, err := http.DefaultClient.Do(reqInfo)
+	if err != nil || respInfo.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/v1/hub-info failed: err=%v resp=%v", err, respInfo)
+	}
+	var hubInfo struct {
+		OK               bool   `json:"ok"`
+		HubToken         string `json:"hub_token"`
+		HubTokenRedacted string `json:"hub_token_redacted"`
+	}
+	_ = json.NewDecoder(respInfo.Body).Decode(&hubInfo)
+	_ = respInfo.Body.Close()
+	if !hubInfo.OK || hubInfo.HubToken != "hub-tok" || hubInfo.HubTokenRedacted == "" {
+		t.Fatalf("unexpected /api/v1/hub-info payload: %+v", hubInfo)
+	}
+
 	// 4. Web UI index served at "/"
 	webResp, err := http.Get(ts.URL + "/")
 	if err != nil || webResp.StatusCode != http.StatusOK {

@@ -143,6 +143,7 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/api/v1/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("/api/v1/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/v1/hub-info", s.withAuth(s.handleHubInfo))
 	mux.HandleFunc("/api/v1/ws/terminal", s.withAuth(s.handleTerminalWS))
 	mux.HandleFunc("/api/v1/nodes", s.withAuth(s.handleListNodes))
 	mux.HandleFunc("/api/v1/nodes/", s.withAuth(s.handleNodeAction))
@@ -261,6 +262,25 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   86400 * 30,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func redactToken(tok string) string {
+	if len(tok) <= 10 {
+		return "••••••••"
+	}
+	return tok[:7] + "••••••••" + tok[len(tok)-4:]
+}
+
+func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                 true,
+		"hub_token":          s.token,
+		"hub_token_redacted": redactToken(s.token),
+	})
 }
 
 func (s *Server) stateFilePath() string {
