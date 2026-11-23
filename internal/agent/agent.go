@@ -3,7 +3,6 @@ package agent
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +21,7 @@ import (
 	"ssh-fleet/internal/power"
 	"ssh-fleet/internal/protocol"
 	"ssh-fleet/internal/wol"
+	"ssh-fleet/internal/ws"
 )
 
 type Options struct {
@@ -457,82 +457,13 @@ func DialUpgrade(ctx context.Context, baseURL, pathWithQuery, token, proto strin
 	return DialUpgradeWithHeaders(ctx, baseURL, pathWithQuery, token, proto, nil)
 }
 
-// DialUpgradeWithHeaders opens a raw TCP/TLS HTTP/1.1 Upgrade connection with optional extra headers (e.g. Cloudflare Access Service Token).
-func DialUpgradeWithHeaders(ctx context.Context, baseURL, pathWithQuery, token, proto string, extraHeaders map[string]string) (net.Conn, *bufio.Reader, error) {
-	u, err := url.Parse(strings.TrimRight(baseURL, "/"))
+// DialUpgradeWithHeaders opens an RFC 6455 WebSocket tunnel to the Hub with Bearer auth and optional headers (e.g. Cloudflare Access Service Token).
+func DialUpgradeWithHeaders(ctx context.Context, baseURL, pathWithQuery, token, _ string, extraHeaders map[string]string) (net.Conn, *bufio.Reader, error) {
+	conn, err := ws.DialClient(ctx, baseURL, pathWithQuery, token, extraHeaders)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	scheme := strings.ToLower(u.Scheme)
-	host := u.Host
-	if !strings.Contains(host, ":") {
-		if scheme == "https" || scheme == "wss" {
-			host += ":443"
-		} else {
-			host += ":80"
-		}
-	}
-
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	var conn net.Conn
-	if scheme == "https" || scheme == "wss" {
-		tlsDialer := &tls.Dialer{
-			NetDialer: dialer,
-			Config:    &tls.Config{ServerName: u.Hostname()},
-		}
-		conn, err = tlsDialer.DialContext(ctx, "tcp", host)
-	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", host)
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-
-	basePath := strings.TrimRight(u.Path, "/")
-	reqTarget := basePath + pathWithQuery
-
-	var headerBuf strings.Builder
-	for k, v := range extraHeaders {
-		if strings.TrimSpace(v) != "" {
-			headerBuf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
-		}
-	}
-
-	reqStr := fmt.Sprintf(
-		"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: %s\r\nAuthorization: Bearer %s\r\n%s\r\n",
-		reqTarget,
-		u.Host,
-		proto,
-		token,
-		headerBuf.String(),
-	)
-	if _, err := conn.Write([]byte(reqStr)); err != nil {
-		_ = conn.Close()
-		return nil, nil, err
-	}
-
-	br := bufio.NewReader(conn)
-	statusLine, err := br.ReadString('\n')
-	if err != nil {
-		_ = conn.Close()
-		return nil, nil, err
-	}
-	if !strings.Contains(statusLine, "101") {
-		_ = conn.Close()
-		return nil, nil, fmt.Errorf("hub upgrade failed: %s", strings.TrimSpace(statusLine))
-	}
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			_ = conn.Close()
-			return nil, nil, err
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
-	}
-	return conn, br, nil
+	return conn, bufio.NewReader(conn), nil
 }
 
 // PipeStdioToProxy opens a proxied SSH stream for a target node and pipes it over stdin/stdout (OpenSSH ProxyCommand).

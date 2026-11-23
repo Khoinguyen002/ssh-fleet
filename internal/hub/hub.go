@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"ssh-fleet/internal/protocol"
+	"ssh-fleet/internal/ws"
 )
 
 type bufferedConn struct {
@@ -613,24 +614,32 @@ func (s *Server) sendAndWait(agent *activeAgent, frame protocol.ControlFrame, ti
 	}
 }
 
-func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
+func upgradeTunnelConn(w http.ResponseWriter, r *http.Request, customProto string) (net.Conn, error) {
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return ws.UpgradeServer(w, r)
+	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		return
+		return nil, errors.New("hijacking not supported")
 	}
 	conn, rw, err := hj.Hijack()
 	if err != nil {
-		return
+		return nil, err
 	}
-
-	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: ssh-fleet-control\r\nConnection: Upgrade\r\n\r\n")
+	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: " + customProto + "\r\nConnection: Upgrade\r\n\r\n")
 	if err := rw.Flush(); err != nil {
 		_ = conn.Close()
+		return nil, err
+	}
+	return wrapHijackedConn(conn, rw), nil
+}
+
+func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
+	hConn, err := upgradeTunnelConn(w, r, "ssh-fleet-control")
+	if err != nil {
 		return
 	}
-
-	hConn := wrapHijackedConn(conn, rw)
 	scanner := bufio.NewScanner(hConn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -756,22 +765,10 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-	conn, rw, err := hj.Hijack()
+	wrapped, err := upgradeTunnelConn(w, r, "ssh-fleet-stream")
 	if err != nil {
 		return
 	}
-	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: ssh-fleet-stream\r\nConnection: Upgrade\r\n\r\n")
-	if err := rw.Flush(); err != nil {
-		_ = conn.Close()
-		return
-	}
-
-	wrapped := wrapHijackedConn(conn, rw)
 	select {
 	case ch <- wrapped:
 	default:
@@ -825,25 +822,11 @@ func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		_ = agentConn.Close()
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-	clientConn, rw, err := hj.Hijack()
+	wrappedClient, err := upgradeTunnelConn(w, r, "ssh-fleet-proxy")
 	if err != nil {
 		_ = agentConn.Close()
 		return
 	}
-	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: ssh-fleet-proxy\r\nConnection: Upgrade\r\n\r\n")
-	if err := rw.Flush(); err != nil {
-		_ = clientConn.Close()
-		_ = agentConn.Close()
-		return
-	}
-
-	wrappedClient := wrapHijackedConn(clientConn, rw)
 	spliceConns(wrappedClient, agentConn)
 }
 

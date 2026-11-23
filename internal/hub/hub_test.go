@@ -68,8 +68,18 @@ func TestHubEndToEndProxyPowerWoLAndVaultSync(t *testing.T) {
 		t.Fatalf("NewServer error: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-	defer srv.Close()
+	var cancelLaptop, cancelRelay context.CancelFunc
+	defer func() {
+		if cancelRelay != nil {
+			cancelRelay()
+		}
+		if cancelLaptop != nil {
+			cancelLaptop()
+		}
+		_ = srv.Close()
+		ts.Close()
+		time.Sleep(80 * time.Millisecond)
+	}()
 
 	// 1. Start mock local SSHD echo server on ephemeral port.
 	sshdLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -122,8 +132,8 @@ func TestHubEndToEndProxyPowerWoLAndVaultSync(t *testing.T) {
 		t.Fatalf("NewClient laptopAgent: %v", err)
 	}
 
-	laptopCtx, cancelLaptop := context.WithCancel(context.Background())
-	defer cancelLaptop()
+	var laptopCtx context.Context
+	laptopCtx, cancelLaptop = context.WithCancel(context.Background())
 	go func() { _ = laptopAgent.Run(laptopCtx) }()
 
 	var wolMu sync.Mutex
@@ -158,8 +168,8 @@ func TestHubEndToEndProxyPowerWoLAndVaultSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient relayAgent: %v", err)
 	}
-	relayCtx, cancelRelay := context.WithCancel(context.Background())
-	defer cancelRelay()
+	var relayCtx context.Context
+	relayCtx, cancelRelay = context.WithCancel(context.Background())
 	go func() { _ = relayAgent.Run(relayCtx) }()
 
 	// Wait for both agents to register on Hub.
@@ -305,8 +315,11 @@ func TestCloudflareAccessAuthAndWebSocketTerminal(t *testing.T) {
 		t.Fatalf("NewServerWithOptions: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
-	defer srv.Close()
+	defer func() {
+		_ = srv.Close()
+		ts.Close()
+		time.Sleep(80 * time.Millisecond)
+	}()
 
 	// 1. Unauthorized without CF Access email or Bearer token
 	req0, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/auth/status", nil)
@@ -374,8 +387,13 @@ func TestCloudflareAccessAuthAndWebSocketTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	var ctx context.Context
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		time.Sleep(60 * time.Millisecond)
+	}()
 	go func() { _ = ag.Run(ctx) }()
 
 	deadline := time.Now().Add(4 * time.Second)
