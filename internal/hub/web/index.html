@@ -790,7 +790,9 @@
         const sub = [t.user ? `${t.user}@${t.host}` : t.host, t.os, wolLine].filter(Boolean).join(' · ');
         const isKeepAwake = t.powerState === 'keep-awake';
         const allowPowerCtrl = t.kind === 'hub-device' && !t.isVps;
-        const canWake = t.online || (t.wolBound && relayInfo && relayInfo.online);
+        const isSoftSleep = t.online && t.powerState === 'soft-sleep';
+        const showWake = allowPowerCtrl && (isSoftSleep || t.wolBound);
+        const canWake = isSoftSleep || (t.wolBound && relayInfo && relayInfo.online);
 
         return `
           <div class="card">
@@ -804,7 +806,7 @@
             <div class="actions">
               ${t.kind === 'hub-device' && t.online ? `<button class="primary" onclick="openAgentTerminal('${escAttr(t.nodeId)}','${escAttr(t.name)}')">>_ Shell</button>` : ''}
               ${(t.kind === 'vps' || t.online) ? `<button onclick="openSSHTerminal(${idx})">SSH</button>` : ''}
-              ${allowPowerCtrl ? `<button class="wake" ${canWake ? '' : 'disabled style="opacity:0.45;cursor:not-allowed;"'} onclick="sendPower('${escAttr(t.nodeId)}','wake')">${canWake ? '⚡ Wake' : (t.wolBound ? '⚡ Relay Offline' : '⚡ Unbound')}</button>` : ''}
+              ${showWake ? `<button class="wake" ${canWake ? '' : 'disabled style="opacity:0.45;cursor:not-allowed;"'} onclick="sendPower('${escAttr(t.nodeId)}','wake')">${canWake ? '⚡ Wake' : '⚡ Relay Offline'}</button>` : ''}
               ${allowPowerCtrl ? `<button onclick="openWolModal('${escAttr(t.nodeId)}')">⚙ WoL</button>` : ''}
               ${allowPowerCtrl && t.online ? `<button class="sleep" onclick="sendPower('${escAttr(t.nodeId)}','soft-sleep')">🌙 Soft Sleep</button>` : ''}
               ${allowPowerCtrl && t.online ? `<button onclick="sendPower('${escAttr(t.nodeId)}','${isKeepAwake ? 'keep-awake-off' : 'keep-awake-on'}')">☕ ${isKeepAwake ? 'Awake ON' : 'Keep Awake'}</button>` : ''}
