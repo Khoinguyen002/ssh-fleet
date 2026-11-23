@@ -648,9 +648,7 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "both MAC address and wake_relay_id must be provided to bind Wake-on-LAN"})
 				return
 			}
-			_, isESP := s.wakeReg.Get(relayID)
-			_, isPeer := s.nodes[relayID]
-			if !isESP && !isPeer {
+			if _, isESP := s.wakeReg.Get(relayID); !isESP {
 				s.mu.Unlock()
 				writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": fmt.Sprintf("wake relay %q not found", relayID)})
 				return
@@ -762,10 +760,9 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 
 		s.mu.RLock()
 		espRelay := s.esp32Relays[relayID]
-		peerRelay := s.agents[relayID]
 		s.mu.RUnlock()
 
-		if espRelay == nil && peerRelay == nil {
+		if espRelay == nil {
 			writeJSON(w, http.StatusServiceUnavailable, protocol.PowerResponse{
 				OK:     false,
 				NodeID: nodeID,
@@ -774,45 +771,18 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if espRelay != nil {
-			if err := s.sendESP32Wake(espRelay, mac, bcast, port, 5*time.Second); err != nil {
-				writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{
-					OK:     false,
-					NodeID: nodeID,
-					Error:  err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusOK, protocol.PowerResponse{
-				OK:     true,
-				NodeID: nodeID,
-				Method: "wol-esp32-relay",
-				Relays: []string{relayID},
-			})
-			return
-		}
-
-		ack, err := s.sendAndWait(peerRelay, protocol.ControlFrame{
-			Type:        "wol-cmd",
-			MAC:         mac,
-			BroadcastIP: bcast,
-		}, 5*time.Second)
-		if err != nil || !ack.OK {
-			errMsg := ack.Error
-			if err != nil {
-				errMsg = err.Error()
-			}
+		if err := s.sendESP32Wake(espRelay, mac, bcast, port, 5*time.Second); err != nil {
 			writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{
 				OK:     false,
 				NodeID: nodeID,
-				Error:  errMsg,
+				Error:  err.Error(),
 			})
 			return
 		}
 		writeJSON(w, http.StatusOK, protocol.PowerResponse{
 			OK:     true,
 			NodeID: nodeID,
-			Method: "wol-peer-relay",
+			Method: "wol-esp32-relay",
 			Relays: []string{relayID},
 		})
 		return

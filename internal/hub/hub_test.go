@@ -268,34 +268,24 @@ func TestHubEndToEndProxyPowerWoLAndVaultSync(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 
-	// Unbound offline laptop must refuse wake until manually bound to MAC + Wake Relay.
+	// Unbound offline laptop must refuse wake until manually bound to MAC + ESP32 Wake Relay.
 	unboundRes := postPower("laptop-1", protocol.PowerRequest{Action: protocol.ActionWake})
 	if unboundRes.OK {
 		t.Fatalf("expected wake to fail when WoL is not bound, got %+v", unboundRes)
 	}
 
-	// Manually bind laptop-1 to home-pc-relay via PATCH /api/v1/nodes/laptop-1/wol
-	bindPayload := []byte(`{"wol":{"mac":"aa:bb:cc:dd:ee:01","broadcast_ip":"192.168.10.255","port":9,"wake_relay_id":"home-pc-relay"}}`)
-	bindReq, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/nodes/laptop-1/wol", bytes.NewReader(bindPayload))
-	bindReq.Header.Set("Authorization", "Bearer "+token)
-	bindResp, err := http.DefaultClient.Do(bindReq)
-	if err != nil || bindResp.StatusCode != http.StatusOK {
-		t.Fatalf("PATCH wol bind failed: err=%v resp=%v", err, bindResp)
+	// Binding to a Peer PC instead of a registered ESP32 Wake Relay must be rejected (404).
+	bindPeerPayload := []byte(`{"wol":{"mac":"aa:bb:cc:dd:ee:01","broadcast_ip":"192.168.10.255","port":9,"wake_relay_id":"home-pc-relay"}}`)
+	bindPeerReq, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/nodes/laptop-1/wol", bytes.NewReader(bindPeerPayload))
+	bindPeerReq.Header.Set("Authorization", "Bearer "+token)
+	bindPeerResp, err := http.DefaultClient.Do(bindPeerReq)
+	if err != nil {
+		t.Fatalf("PATCH wol bind err: %v", err)
 	}
-	_ = bindResp.Body.Close()
-
-	wolWakeRes := postPower("laptop-1", protocol.PowerRequest{Action: protocol.ActionWake})
-	if !wolWakeRes.OK || wolWakeRes.Method != "wol-peer-relay" {
-		t.Fatalf("expected wol-peer-relay wake response, got %+v", wolWakeRes)
+	_ = bindPeerResp.Body.Close()
+	if bindPeerResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 rejecting peer PC as wake relay, got %d", bindPeerResp.StatusCode)
 	}
-	if len(wolWakeRes.Relays) != 1 || wolWakeRes.Relays[0] != "home-pc-relay" {
-		t.Fatalf("expected home-pc-relay to dispatch WoL, got %+v", wolWakeRes.Relays)
-	}
-	wolMu.Lock()
-	if len(wolReceived) != 1 || wolReceived[0] != "aa:bb:cc:dd:ee:01@192.168.10.255" {
-		t.Fatalf("unexpected WoL packet dispatched on relay: %v", wolReceived)
-	}
-	wolMu.Unlock()
 
 	// 6. Test encrypted Vault blob PUT and GET on Hub.
 	vaultBlob := []byte(`{"magic":"SFV1","ciphertext":"opaque-e2ee-data"}`)

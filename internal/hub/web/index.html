@@ -425,10 +425,9 @@
           realHubToken = info.hub_token || '';
           redactedHubToken = info.hub_token_redacted || 'sf_••••';
           const onlineESP = wakeRelays.filter(r => r.online).length;
-          const onlinePeers = hubNodes.filter(n => n.online && !n.is_vps).length;
           const rb = document.getElementById('relayBadge');
           rb.style.display = 'inline-block';
-          rb.textContent = `ESP32 Relays: ${onlineESP}/${wakeRelays.length}` + (onlinePeers ? ` · Peers: ${onlinePeers}` : '');
+          rb.textContent = `Wake Relays: ${onlineESP}/${wakeRelays.length}`;
           rb.className = onlineESP > 0 ? 'badge ok' : 'badge warn';
           renderConnectScripts();
         }
@@ -715,8 +714,6 @@
       if (!relayId) return null;
       const esp = wakeRelays.find(r => r.id === relayId);
       if (esp) return { name: esp.name, online: esp.online };
-      const peer = hubNodes.find(n => n.node_id === relayId);
-      if (peer) return { name: peer.name || peer.node_id, online: peer.online };
       return { name: relayId, online: false };
     }
 
@@ -729,15 +726,10 @@
       document.getElementById('wolBcastInput').value = item.broadcastIp || item.detectedBroadcast || '';
 
       const sel = document.getElementById('wolRelaySelect');
-      const opts = ['<option value="">-- Select Wake Relay --</option>'];
+      const opts = ['<option value="">-- Select Wake Relay (ESP32) --</option>'];
       for (const r of wakeRelays) {
         const selected = item.relayNodeId === r.id ? 'selected' : '';
-        opts.push(`<option value="${escAttr(r.id)}" ${selected}>[ESP32] ${esc(r.name)} (${r.online ? 'ONLINE' : 'OFFLINE'})</option>`);
-      }
-      for (const n of hubNodes) {
-        if (n.is_vps || n.node_id === nodeId) continue;
-        const selected = item.relayNodeId === n.node_id ? 'selected' : '';
-        opts.push(`<option value="${escAttr(n.node_id)}" ${selected}>[Peer PC] ${esc(n.name || n.node_id)} (${n.online ? 'ONLINE' : 'OFFLINE'})</option>`);
+        opts.push(`<option value="${escAttr(r.id)}" ${selected}>${esc(r.name)} (${r.online ? 'ONLINE' : 'OFFLINE'})</option>`);
       }
       sel.innerHTML = opts.join('');
       document.getElementById('wolModal').classList.add('open');
