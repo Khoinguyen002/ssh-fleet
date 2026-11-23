@@ -109,6 +109,8 @@ type Server struct {
 	trustCFAccess bool
 	cfEmails      []string
 	wakeReg       *WakeRelayRegistry
+	joinTokens    *JoinTokenStore
+	nodeCreds     *NodeCredStore
 	mu            sync.RWMutex
 	nodes         map[string]*protocol.NodeInfo
 	agents        map[string]*activeAgent
@@ -148,6 +150,8 @@ func NewServerWithOptions(opts Options) (*Server, error) {
 		trustCFAccess: trustCF,
 		cfEmails:      emails,
 		wakeReg:       NewWakeRelayRegistry(opts.DataDir),
+		joinTokens:    NewJoinTokenStore(),
+		nodeCreds:     NewNodeCredStore(opts.DataDir),
 		nodes:         make(map[string]*protocol.NodeInfo),
 		agents:        make(map[string]*activeAgent),
 		esp32Relays:   make(map[string]*esp32WakeRelay),
@@ -167,6 +171,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("/api/v1/auth/login", s.handleAuthLogin)
 	mux.HandleFunc("/api/v1/hub-info", s.withAuth(s.handleHubInfo))
+	mux.HandleFunc("/api/v1/join-tokens", s.withAuth(s.handleCreateJoinToken))
+	mux.HandleFunc("/api/v1/join/exchange", s.handleJoinExchange)
 	mux.HandleFunc("/api/v1/ws/terminal", s.withAuth(s.handleTerminalWS))
 	mux.HandleFunc("/api/v1/nodes", s.withAuth(s.handleListNodes))
 	mux.HandleFunc("/api/v1/nodes/", s.withAuth(s.handleNodeAction))
@@ -205,24 +211,32 @@ func (s *Server) Close() error {
 	return nil
 }
 
+func (s *Server) isTokenValid(tok string) bool {
+	if subtle.ConstantTimeCompare([]byte(tok), []byte(s.token)) == 1 {
+		return true
+	}
+	_, ok := s.nodeCreds.Verify(tok)
+	return ok
+}
+
 func (s *Server) isAuthorized(r *http.Request) (bool, string) {
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	const prefix = "Bearer "
 	if strings.HasPrefix(auth, prefix) {
 		got := strings.TrimPrefix(auth, prefix)
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1 {
+		if s.isTokenValid(got) {
 			return true, ""
 		}
 	}
 
 	if c, err := r.Cookie("sf_token"); err == nil && c.Value != "" {
-		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(s.token)) == 1 {
+		if s.isTokenValid(c.Value) {
 			return true, ""
 		}
 	}
 
 	if qTok := strings.TrimSpace(r.URL.Query().Get("token")); qTok != "" {
-		if subtle.ConstantTimeCompare([]byte(qTok), []byte(s.token)) == 1 {
+		if s.isTokenValid(qTok) {
 			return true, ""
 		}
 	}
@@ -310,9 +324,47 @@ func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                  true,
-		"hub_token":           s.token,
 		"hub_token_redacted":  redactToken(s.token),
+		"join_token_ttl_sec":  int(DefaultJoinTokenTTL.Seconds()),
 		"esp32_relays_online": espCount,
+	})
+}
+
+func (s *Server) handleCreateJoinToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	tok, exp := s.joinTokens.Create(DefaultJoinTokenTTL)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"ok":         true,
+		"join_token": tok,
+		"expires_at": exp,
+		"ttl_sec":    int(DefaultJoinTokenTTL.Seconds()),
+	})
+}
+
+func (s *Server) handleJoinExchange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		JoinToken string `json:"join_token"`
+		NodeID    string `json:"node_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request body"})
+		return
+	}
+	if !s.joinTokens.Consume(body.JoinToken) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "one-time join token is invalid, expired, or already used"})
+		return
+	}
+	nodeTok := s.nodeCreds.Issue(body.NodeID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"node_token": nodeTok,
 	})
 }
 

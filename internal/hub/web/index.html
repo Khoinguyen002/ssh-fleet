@@ -217,7 +217,7 @@
       <div class="card-head">
         <div>
           <div class="card-title">➕ Connect New Device (1-Line Setup)</div>
-          <div class="card-sub">The Hub token is masked on screen and automatically injected into your clipboard on copy. Replace <code>&lt;CF_CLIENT_ID&gt;</code> &amp; <code>&lt;CF_CLIENT_SECRET&gt;</code> with your Cloudflare Access Service Token.</div>
+          <div class="card-sub">A fresh <strong>one-time join token (5m TTL)</strong> is minted only when you click <strong>Copy Command</strong>. Replace <code>&lt;CF_CLIENT_ID&gt;</code> &amp; <code>&lt;CF_CLIENT_SECRET&gt;</code> with your Cloudflare Access Service Token.</div>
         </div>
         <button onclick="toggleConnectPanel(false)">✕</button>
       </div>
@@ -543,8 +543,9 @@
     }
 
     function renderConnectScripts() {
-      document.getElementById('unixScriptBox').textContent = buildJoinScript('unix', redactedHubToken);
-      document.getElementById('winScriptBox').textContent = buildJoinScript('win', redactedHubToken);
+      const masked = 'sfj_••••••••';
+      document.getElementById('unixScriptBox').textContent = buildJoinScript('unix', masked);
+      document.getElementById('winScriptBox').textContent = buildJoinScript('win', masked);
     }
 
     function toggleConnectPanel(force) {
@@ -554,22 +555,38 @@
       if (show) renderConnectScripts();
     }
 
+    async function mintOneTimeJoinToken() {
+      const res = await fetch('/api/v1/join-tokens', {
+        method: 'POST',
+        headers: authHeaders(),
+        credentials: 'include'
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok || !data.join_token) {
+        throw new Error(data.error || 'failed to mint one-time join token');
+      }
+      return data.join_token;
+    }
+
     async function copyJoinScript(kind) {
-      const tok = realHubToken || redactedHubToken;
-      const text = buildJoinScript(kind, tok);
       try {
-        await navigator.clipboard.writeText(text);
-        showToast('Copied! Hub token injected — replace <CF_CLIENT_ID> & <CF_CLIENT_SECRET>.');
-      } catch {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        showToast('Copied! Hub token injected — replace <CF_CLIENT_ID> & <CF_CLIENT_SECRET>.');
+        const oneTimeTok = await mintOneTimeJoinToken();
+        const text = buildJoinScript(kind, oneTimeTok);
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+        }
+        showToast('Minted 5-min one-time join token & copied! Replace <CF_CLIENT_ID> & <CF_CLIENT_SECRET>.');
+      } catch (e) {
+        showToast('Copy failed: ' + e.message);
       }
     }
 
@@ -577,15 +594,9 @@
       const el = document.getElementById(id);
       if (!el) return;
       el.addEventListener('copy', (e) => {
-        if (!realHubToken) return;
+        e.preventDefault();
         const kind = id === 'winScriptBox' ? 'win' : 'unix';
-        const sel = window.getSelection ? window.getSelection().toString() : '';
-        const textToCopy = sel ? sel.replace(redactedHubToken, realHubToken) : buildJoinScript(kind, realHubToken);
-        if (e.clipboardData) {
-          e.preventDefault();
-          e.clipboardData.setData('text/plain', textToCopy);
-          showToast('Copied with real hub_token injected!');
-        }
+        void copyJoinScript(kind);
       });
     });
 

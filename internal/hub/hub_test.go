@@ -399,11 +399,59 @@ func TestCloudflareAccessAuthAndWebSocketTerminal(t *testing.T) {
 		OK               bool   `json:"ok"`
 		HubToken         string `json:"hub_token"`
 		HubTokenRedacted string `json:"hub_token_redacted"`
+		JoinTokenTTLSec  int    `json:"join_token_ttl_sec"`
 	}
 	_ = json.NewDecoder(respInfo.Body).Decode(&hubInfo)
 	_ = respInfo.Body.Close()
-	if !hubInfo.OK || hubInfo.HubToken != "hub-tok" || hubInfo.HubTokenRedacted == "" {
-		t.Fatalf("unexpected /api/v1/hub-info payload: %+v", hubInfo)
+	if !hubInfo.OK || hubInfo.HubToken != "" || hubInfo.HubTokenRedacted == "" || hubInfo.JoinTokenTTLSec != 300 {
+		t.Fatalf("unexpected /api/v1/hub-info payload (must not expose hub_token): %+v", hubInfo)
+	}
+
+	// 3c. Mint a 5-min one-time join token, exchange once -> succeeds, replay -> 401
+	jtReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/join-tokens", nil)
+	jtReq.Header.Set("Cf-Access-Authenticated-User-Email", "khoi@example.com")
+	jtResp, err := http.DefaultClient.Do(jtReq)
+	if err != nil || jtResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/join-tokens failed: err=%v resp=%v", err, jtResp)
+	}
+	var jtOut struct {
+		OK        bool   `json:"ok"`
+		JoinToken string `json:"join_token"`
+		TTLSec    int    `json:"ttl_sec"`
+	}
+	_ = json.NewDecoder(jtResp.Body).Decode(&jtOut)
+	_ = jtResp.Body.Close()
+	if !jtOut.OK || !strings.HasPrefix(jtOut.JoinToken, "sfj_") || jtOut.TTLSec != 300 {
+		t.Fatalf("unexpected join token: %+v", jtOut)
+	}
+
+	exPayload, _ := json.Marshal(map[string]string{"join_token": jtOut.JoinToken, "node_id": "enrolled-laptop"})
+	exResp, err := http.Post(ts.URL+"/api/v1/join/exchange", "application/json", bytes.NewReader(exPayload))
+	if err != nil || exResp.StatusCode != http.StatusOK {
+		t.Fatalf("exchange join token failed: err=%v resp=%v", err, exResp)
+	}
+	var exOut struct {
+		OK        bool   `json:"ok"`
+		NodeToken string `json:"node_token"`
+	}
+	_ = json.NewDecoder(exResp.Body).Decode(&exOut)
+	_ = exResp.Body.Close()
+	if !exOut.OK || !strings.HasPrefix(exOut.NodeToken, "sfn_enrolled-laptop.") {
+		t.Fatalf("unexpected node_token: %+v", exOut)
+	}
+
+	// Replay same one-time join token must fail with 401
+	exResp2, _ := http.Post(ts.URL+"/api/v1/join/exchange", "application/json", bytes.NewReader(exPayload))
+	_ = exResp2.Body.Close()
+	if exResp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on replayed join token, got %d", exResp2.StatusCode)
+	}
+
+	// Verify expired join token is rejected
+	expTok, _ := srv.joinTokens.Create(1 * time.Millisecond)
+	time.Sleep(15 * time.Millisecond)
+	if srv.joinTokens.Consume(expTok) {
+		t.Fatalf("expected expired join token to be rejected")
 	}
 
 	// 4. Web UI index served at "/"

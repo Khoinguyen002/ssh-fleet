@@ -1176,13 +1176,6 @@ func cmdJoin(args []string) error {
 	}
 
 	cfg.HubURL = strings.TrimRight(hubURL, "/")
-	cfg.HubToken = token
-	if *cfIDFlag != "" {
-		cfg.CFClientID = *cfIDFlag
-	}
-	if *cfSecretFlag != "" {
-		cfg.CFClientSecret = *cfSecretFlag
-	}
 	if *nameFlag != "" {
 		cfg.AgentName = *nameFlag
 	}
@@ -1192,6 +1185,22 @@ func cmdJoin(args []string) error {
 	if *sshPortFlag > 0 {
 		cfg.SSHPort = *sshPortFlag
 	}
+	if *cfIDFlag != "" {
+		cfg.CFClientID = *cfIDFlag
+	}
+	if *cfSecretFlag != "" {
+		cfg.CFClientSecret = *cfSecretFlag
+	}
+
+	if strings.HasPrefix(strings.TrimSpace(token), "sfj_") {
+		exchanged, err := exchangeJoinToken(cfg.HubURL, strings.TrimSpace(token), cfg.NodeID, cfHeaderMap(cfg))
+		if err != nil {
+			return fmt.Errorf("one-time join token exchange failed: %w", err)
+		}
+		token = exchanged
+	}
+	cfg.HubToken = token
+
 	if err := vault.SaveConfig(configPath(), cfg); err != nil {
 		return err
 	}
@@ -1238,6 +1247,44 @@ SyncSSH:
 
 	fmt.Println("Done! Try `sf list` or `sf` to see and connect to your devices.")
 	return nil
+}
+
+func exchangeJoinToken(hubURL, joinToken, nodeID string, extraHeaders map[string]string) (string, error) {
+	payload, _ := json.Marshal(map[string]string{
+		"join_token": joinToken,
+		"node_id":    nodeID,
+	})
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(hubURL, "/")+"/api/v1/join/exchange", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range extraHeaders {
+		if strings.TrimSpace(v) != "" {
+			req.Header.Set(k, v)
+		}
+	}
+	resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		OK        bool   `json:"ok"`
+		NodeToken string `json:"node_token"`
+		Error     string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK || !out.OK || out.NodeToken == "" {
+		if out.Error == "" {
+			out.Error = resp.Status
+		}
+		return "", errors.New(out.Error)
+	}
+	return out.NodeToken, nil
 }
 
 func installAndStartAgent(selfBin string, cfg vault.LocalConfig) (string, error) {
