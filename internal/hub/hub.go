@@ -248,6 +248,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/tunnel/control", s.withAuth(s.handleControlTunnel))
 	mux.HandleFunc("/tunnel/agent-stream", s.withAuth(s.handleAgentStream))
 	mux.HandleFunc("/tunnel/client-proxy", s.withAuth(s.handleClientProxy))
+	mux.HandleFunc("/tunnel/client-shell", s.withAuth(s.handleClientShell))
+	mux.HandleFunc("/tunnel/client-exec", s.withAuth(s.handleClientExec))
 	mux.HandleFunc("/hub/ws/wake", s.handleESP32WakeTunnel)
 	mux.Handle("/", webHandler())
 	return mux
@@ -1767,6 +1769,24 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
+	s.handleClientTunnel(w, r, protocol.ControlFrame{Type: "open-ssh-stream"}, "ssh-fleet-proxy")
+}
+
+func (s *Server) handleClientShell(w http.ResponseWriter, r *http.Request) {
+	cols, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("cols")))
+	rows, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("rows")))
+	s.handleClientTunnel(w, r, protocol.ControlFrame{
+		Type: "open-shell-stream",
+		Cols: cols,
+		Rows: rows,
+	}, "ssh-fleet-shell")
+}
+
+func (s *Server) handleClientExec(w http.ResponseWriter, r *http.Request) {
+	s.handleClientTunnel(w, r, protocol.ControlFrame{Type: "open-exec-stream"}, "ssh-fleet-exec")
+}
+
+func (s *Server) handleClientTunnel(w http.ResponseWriter, r *http.Request, frame protocol.ControlFrame, proto string) {
 	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
 	if nodeID == "" {
 		http.Error(w, "missing node_id", http.StatusBadRequest)
@@ -1789,10 +1809,8 @@ func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
 	ps := s.registerPendingStream(streamID, nodeID)
 	defer s.cleanupPendingStream(streamID, ps)
 
-	if err := agent.send(protocol.ControlFrame{
-		Type:     "open-ssh-stream",
-		StreamID: streamID,
-	}); err != nil {
+	frame.StreamID = streamID
+	if err := agent.send(frame); err != nil {
 		http.Error(w, "failed to reach agent", http.StatusBadGateway)
 		return
 	}
@@ -1823,7 +1841,7 @@ func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wrappedClient, err := upgradeTunnelConn(w, r, "ssh-fleet-proxy")
+	wrappedClient, err := upgradeTunnelConn(w, r, proto)
 	if err != nil {
 		_ = agentConn.Close()
 		return

@@ -35,13 +35,18 @@ type UpgradeOptions struct {
 type UpgradeError struct {
 	StatusCode int
 	StatusLine string
+	Body       string
 }
 
 func (e *UpgradeError) Error() string {
+	base := fmt.Sprintf("websocket upgrade failed: HTTP %d", e.StatusCode)
 	if e.StatusLine != "" {
-		return fmt.Sprintf("websocket upgrade failed: %s", e.StatusLine)
+		base = fmt.Sprintf("websocket upgrade failed: %s", e.StatusLine)
 	}
-	return fmt.Sprintf("websocket upgrade failed: HTTP %d", e.StatusCode)
+	if msg := strings.TrimSpace(e.Body); msg != "" {
+		return base + ": " + msg
+	}
+	return base
 }
 
 // Conn implements net.Conn over an RFC 6455 WebSocket connection.
@@ -232,11 +237,36 @@ func DialClient(ctx context.Context, baseURL, pathWithQuery, token string, extra
 		statusCode, _ = strconv.Atoi(fields[1])
 	}
 	if statusCode != http.StatusSwitchingProtocols {
+		var contentLen int
+		for lineCount := 0; lineCount < 64; lineCount++ {
+			line, hErr := br.ReadString('\n')
+			if hErr != nil || line == "\r\n" || line == "\n" {
+				break
+			}
+			if idx := strings.Index(line, ":"); idx > 0 {
+				k := strings.ToLower(strings.TrimSpace(line[:idx]))
+				if k == "content-length" {
+					contentLen, _ = strconv.Atoi(strings.TrimSpace(line[idx+1:]))
+				}
+			}
+		}
+		var body string
+		if contentLen > 0 && contentLen <= 4096 {
+			readN := contentLen
+			if readN > 512 {
+				readN = 512
+			}
+			buf := make([]byte, readN)
+			if _, bErr := io.ReadFull(br, buf); bErr == nil {
+				body = strings.Join(strings.Fields(string(buf)), " ")
+			}
+		}
 		finishHandshakeWatch()
 		_ = conn.Close()
 		return nil, &UpgradeError{
 			StatusCode: statusCode,
 			StatusLine: strings.TrimSpace(statusLine),
+			Body:       body,
 		}
 	}
 

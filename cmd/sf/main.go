@@ -35,8 +35,20 @@ import (
 	"ssh-fleet/internal/wol"
 )
 
+type exitCodeError struct {
+	code int
+}
+
+func (e *exitCodeError) Error() string {
+	return fmt.Sprintf("exit status %d", e.code)
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		var exitErr *exitCodeError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.code)
+		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -60,6 +72,10 @@ func run(args []string) error {
 		return cmdFind(args[1:])
 	case "list", "ls":
 		return cmdList(args[1:])
+	case "shell", "sh":
+		return cmdShell(args[1:])
+	case "exec", "run":
+		return cmdExec(args[1:])
 	case "ssh":
 		return cmdSSH(args[1:])
 	case "wake":
@@ -106,6 +122,8 @@ func printUsage() {
 USAGE:
   sf [find [query]]                 Interactive fuzzy search across VPS & Hub devices
   sf list                           List all VPS and live/offline Hub devices
+  sf shell <target> [--wake]        Open direct shell via fleet tunnel (no sshd needed)
+  sf exec <target> [flags] -- <cmd> Run command via fleet tunnel (stdout/stderr/exit code)
   sf ssh <target> [--wake]          Connect via native SSH (or Hub Proxy tunnel)
   sf wake <target> [--unlock-keyring] Wake device (Soft-Wake or LAN Relay WoL)
   sf unlock-keyring <target>        Unlock Linux GNOME login keyring on online node
@@ -460,6 +478,8 @@ func cmdFind(args []string) error {
 	}
 
 	switch choice.Action {
+	case "shell":
+		return launchAgentShell(cfg, choice.Target)
 	case "ssh":
 		return launchSSH(cfg, v, choice.Target, false, nil)
 	case "wake":
@@ -482,6 +502,222 @@ func cmdFind(args []string) error {
 	default:
 		return nil
 	}
+}
+
+func wakeAndWaitTarget(cfg vault.LocalConfig, target *ui.FleetTarget, waitSec int) error {
+	if !target.ViaHub || target.Online {
+		return nil
+	}
+	if err := executePower(cfg, *target, protocol.PowerRequest{
+		Action:      protocol.ActionWake,
+		MAC:         target.MAC,
+		BroadcastIP: target.BroadcastIP,
+		RelayNodeID: target.RelayNodeID,
+	}); err != nil {
+		return err
+	}
+	if waitSec <= 0 {
+		waitSec = 45
+	}
+	fmt.Fprintf(os.Stderr, "Waiting up to %ds for %s to come online...\n", waitSec, target.Name)
+	deadline := time.Now().Add(time.Duration(waitSec) * time.Second)
+	for time.Now().Before(deadline) {
+		nodes, _ := fetchHubNodes(cfg)
+		for _, n := range nodes {
+			if n.NodeID == target.NodeID && n.Online {
+				target.Online = true
+				return nil
+			}
+		}
+		time.Sleep(1500 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting for %s to come online", target.Name)
+}
+
+func cmdShell(args []string) error {
+	fs := flag.NewFlagSet("shell", flag.ContinueOnError)
+	wakeFirst := fs.Bool("wake", false, "Wake device first and wait until online before opening shell")
+	waitSec := fs.Int("wait", 45, "Max seconds to wait for waking node to come online")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) == 0 {
+		return errors.New("usage: sf shell <target> [--wake] [--wait SEC]")
+	}
+	targetQuery := rest[0]
+	if len(rest) > 1 {
+		if err := fs.Parse(rest[1:]); err != nil {
+			return err
+		}
+		if len(fs.Args()) > 0 {
+			return fmt.Errorf("unexpected extra arguments %v (use `sf exec <target> -- <cmd>` to run commands)", fs.Args())
+		}
+	}
+
+	cfg, err := vault.LoadOrInitConfig(configPath())
+	if err != nil {
+		return err
+	}
+	v, _, err := tryLoadVault(cfg, false)
+	if err != nil {
+		return err
+	}
+	target, err := resolveTarget(cfg, v, targetQuery)
+	if err != nil {
+		return err
+	}
+	if *wakeFirst {
+		if err := wakeAndWaitTarget(cfg, &target, *waitSec); err != nil {
+			return err
+		}
+	}
+	return launchAgentShell(cfg, target)
+}
+
+func launchAgentShell(cfg vault.LocalConfig, target ui.FleetTarget) error {
+	if !target.ViaHub || target.NodeID == "" {
+		return fmt.Errorf("target %q is not a Hub-connected node (use `sf ssh %s`)", target.Name, target.Name)
+	}
+	if cfg.HubURL == "" || cfg.HubToken == "" {
+		return errors.New("hub_url and hub_token must be configured via `sf config set` or `sf join`")
+	}
+
+	cols, rows := 0, 0
+	if isTerminal(os.Stdin) {
+		cols, rows = terminalSize(os.Stdin)
+		restore, rErr := enterRawTerminal(os.Stdin)
+		if rErr == nil {
+			defer restore()
+		}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), termSignals()...)
+	defer stop()
+	return agent.RunInteractiveShell(ctx, cfg.HubURL, cfg.HubToken, target.NodeID, cols, rows, os.Stdin, os.Stdout, cfHeaderMap(cfg))
+}
+
+type execOpts struct {
+	targetQuery string
+	command     string
+	dir         string
+	wakeFirst   bool
+	waitSec     int
+	timeoutSec  int
+	noStdin     bool
+}
+
+func parseExecArgs(args []string) (execOpts, error) {
+	const usage = "usage: sf exec <target> [--wake] [--wait SEC] [--cwd DIR] [--timeout SEC] [-n|--no-stdin] -- <command...>"
+	var opts execOpts
+	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
+	fs.BoolVar(&opts.wakeFirst, "wake", false, "Wake device first and wait until online")
+	fs.IntVar(&opts.waitSec, "wait", 45, "Max seconds to wait for waking node to come online")
+	fs.StringVar(&opts.dir, "cwd", "", "Working directory on remote node")
+	fs.IntVar(&opts.timeoutSec, "timeout", 0, "Command timeout in seconds (0 = no timeout)")
+	fs.BoolVar(&opts.noStdin, "no-stdin", false, "Do not read stdin")
+	fs.BoolVar(&opts.noStdin, "n", false, "Shorthand for --no-stdin")
+
+	before := args
+	var after []string
+	hasDashDash := false
+	for i, a := range args {
+		if a == "--" {
+			before = args[:i]
+			after = args[i+1:]
+			hasDashDash = true
+			break
+		}
+	}
+
+	if err := fs.Parse(before); err != nil {
+		return execOpts{}, err
+	}
+	rest := fs.Args()
+
+	var cmdArgs []string
+	if hasDashDash {
+		if len(rest) == 0 || len(after) == 0 {
+			return execOpts{}, errors.New(usage)
+		}
+		opts.targetQuery = rest[0]
+		if len(rest) > 1 {
+			if err := fs.Parse(rest[1:]); err != nil {
+				return execOpts{}, err
+			}
+			if len(fs.Args()) > 0 {
+				return execOpts{}, fmt.Errorf("unexpected arguments before --: %v", fs.Args())
+			}
+		}
+		cmdArgs = after
+	} else {
+		if len(rest) < 2 {
+			return execOpts{}, errors.New(usage)
+		}
+		opts.targetQuery = rest[0]
+		cmdArgs = rest[1:]
+	}
+
+	opts.command = strings.Join(cmdArgs, " ")
+	if strings.TrimSpace(opts.command) == "" {
+		return execOpts{}, errors.New(usage)
+	}
+	return opts, nil
+}
+
+func cmdExec(args []string) error {
+	opts, err := parseExecArgs(args)
+	if err != nil {
+		return err
+	}
+	cfg, err := vault.LoadOrInitConfig(configPath())
+	if err != nil {
+		return err
+	}
+	v, _, err := tryLoadVault(cfg, false)
+	if err != nil {
+		return err
+	}
+	target, err := resolveTarget(cfg, v, opts.targetQuery)
+	if err != nil {
+		return err
+	}
+	if !target.ViaHub || target.NodeID == "" {
+		return fmt.Errorf("target %q is not a Hub-connected node (use `sf ssh %s`)", target.Name, target.Name)
+	}
+	if cfg.HubURL == "" || cfg.HubToken == "" {
+		return errors.New("hub_url and hub_token must be configured via `sf config set` or `sf join`")
+	}
+	if opts.wakeFirst {
+		if err := wakeAndWaitTarget(cfg, &target, opts.waitSec); err != nil {
+			return err
+		}
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if opts.timeoutSec > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(opts.timeoutSec)*time.Second)
+		defer cancel()
+	}
+
+	var stdin io.Reader
+	if !opts.noStdin {
+		stdin = os.Stdin
+	}
+
+	code, err := agent.RunRemoteExec(ctx, cfg.HubURL, cfg.HubToken, target.NodeID, protocol.ExecStartRequest{
+		Command: opts.command,
+		Dir:     opts.dir,
+	}, stdin, os.Stdout, os.Stderr, cfHeaderMap(cfg))
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return &exitCodeError{code: code}
+	}
+	return nil
 }
 
 func cmdSSH(args []string) error {
@@ -511,31 +747,12 @@ func cmdSSH(args []string) error {
 		return err
 	}
 
-	if *wakeFirst && target.ViaHub && !target.Online {
-		if err := executePower(cfg, target, protocol.PowerRequest{
-			Action:      protocol.ActionWake,
-			MAC:         target.MAC,
-			BroadcastIP: target.BroadcastIP,
-			RelayNodeID: target.RelayNodeID,
-		}); err != nil {
+	if *wakeFirst {
+		if err := wakeAndWaitTarget(cfg, &target, *waitSec); err != nil {
 			return err
 		}
-		fmt.Printf("Waiting up to %ds for %s to come online...\n", *waitSec, target.Name)
-		deadline := time.Now().Add(time.Duration(*waitSec) * time.Second)
-		for time.Now().Before(deadline) {
-			nodes, _ := fetchHubNodes(cfg)
-			for _, n := range nodes {
-				if n.NodeID == target.NodeID && n.Online {
-					target.Online = true
-					goto Ready
-				}
-			}
-			time.Sleep(1500 * time.Millisecond)
-		}
-		return fmt.Errorf("timed out waiting for %s to come online", target.Name)
 	}
 
-Ready:
 	return launchSSH(cfg, v, target, false, extraSSHArgs)
 }
 

@@ -398,6 +398,8 @@ func (c *Client) connectOnce(ctx context.Context) (bool, error) {
 			go c.handleOpenStream(ctx, sendFrame, frame.StreamID)
 		case "open-shell-stream":
 			go c.handleOpenShellStream(ctx, sendFrame, frame.StreamID, frame.Cols, frame.Rows)
+		case "open-exec-stream":
+			go c.handleOpenExecStream(ctx, sendFrame, frame.StreamID)
 		case "power-cmd":
 			go c.handlePowerCmd(sendFrame, func() { _ = conn.Close() }, frame)
 		case "wol-cmd":
@@ -662,7 +664,199 @@ func buildInteractiveShellCmd(cols, rows int) *exec.Cmd {
 		}
 	}
 	cmd.Env = shellEnv(os.Environ())
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		cmd.Dir = home
+	}
 	return cmd
+}
+
+func resolveExecDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return ""
+	}
+	if dir == "~" || strings.HasPrefix(dir, "~/") || strings.HasPrefix(dir, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if dir == "~" {
+				return home
+			}
+			return filepath.Join(home, dir[2:])
+		}
+	}
+	return dir
+}
+
+func buildExecCmd(command string) *exec.Cmd {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
+	} else if bash, err := exec.LookPath("bash"); err == nil {
+		cmd = exec.Command(bash, "-c", command)
+	} else {
+		cmd = exec.Command("/bin/sh", "-c", command)
+	}
+	cmd.Env = os.Environ()
+	return cmd
+}
+
+func (c *Client) handleOpenExecStream(ctx context.Context, sendFrame func(protocol.ControlFrame) error, streamID string) {
+	if streamID == "" {
+		return
+	}
+	remoteConn, br, err := DialUpgradeWithHeaders(ctx, c.opts.HubURL, "/tunnel/agent-stream?stream_id="+url.QueryEscape(streamID), c.opts.Token, "ssh-fleet-stream", c.cfHeaders())
+	if err != nil {
+		_ = sendFrame(protocol.ControlFrame{
+			Type:     "stream-error",
+			StreamID: streamID,
+			Error:    err.Error(),
+		})
+		return
+	}
+	defer remoteConn.Close()
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = remoteConn.Close()
+		case <-done:
+		}
+	}()
+
+	var writeM sync.Mutex
+	writeFrame := func(frameType byte, payload []byte) error {
+		writeM.Lock()
+		defer writeM.Unlock()
+		return protocol.WriteExecFrame(remoteConn, frameType, payload)
+	}
+	sendExit := func(code int, errMsg string) {
+		b, _ := json.Marshal(protocol.ExecExitPayload{Code: code, Error: errMsg})
+		_ = writeFrame(protocol.ExecFrameExit, b)
+	}
+
+	_ = remoteConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	firstType, firstPayload, fErr := protocol.ReadExecFrame(br)
+	_ = remoteConn.SetReadDeadline(time.Time{})
+	if fErr != nil {
+		sendExit(2, fmt.Sprintf("failed to read exec request: %v", fErr))
+		return
+	}
+	if firstType != protocol.ExecFrameStart {
+		sendExit(2, fmt.Sprintf("expected start frame, got 0x%02x", firstType))
+		return
+	}
+	var req protocol.ExecStartRequest
+	if err := json.Unmarshal(firstPayload, &req); err != nil {
+		sendExit(2, fmt.Sprintf("invalid exec request: %v", err))
+		return
+	}
+	if strings.TrimSpace(req.Command) == "" {
+		sendExit(2, "empty command")
+		return
+	}
+
+	cmd := buildExecCmd(req.Command)
+	if dir := resolveExecDir(req.Dir); dir != "" {
+		cmd.Dir = dir
+	}
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		sendExit(126, err.Error())
+		return
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		sendExit(126, err.Error())
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		sendExit(126, err.Error())
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		sendExit(126, err.Error())
+		return
+	}
+
+	pipeStream := func(r io.Reader, frameType byte, wg *sync.WaitGroup) {
+		defer wg.Done()
+		buf := make([]byte, 32*1024)
+		for {
+			n, rErr := r.Read(buf)
+			if n > 0 {
+				if wErr := writeFrame(frameType, buf[:n]); wErr != nil {
+					_ = remoteConn.Close()
+					return
+				}
+			}
+			if rErr != nil {
+				return
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go pipeStream(stdout, protocol.ExecFrameStdout, &wg)
+	go pipeStream(stderr, protocol.ExecFrameStderr, &wg)
+
+	pipesDone := make(chan struct{})
+	stdinDone := make(chan struct{})
+	go func() {
+		defer close(stdinDone)
+		for {
+			ft, payload, rErr := protocol.ReadExecFrame(br)
+			if rErr != nil {
+				_ = stdin.Close()
+				timer := time.NewTimer(250 * time.Millisecond)
+				select {
+				case <-pipesDone:
+					timer.Stop()
+				case <-timer.C:
+					if cmd.Process != nil {
+						_ = cmd.Process.Kill()
+					}
+					_ = remoteConn.Close()
+				}
+				return
+			}
+			switch ft {
+			case protocol.ExecFrameStdin:
+				if len(payload) > 0 {
+					_, _ = stdin.Write(payload)
+				}
+			case protocol.ExecFrameEOF:
+				_ = stdin.Close()
+			case protocol.ExecFrameCancel:
+				_ = stdin.Close()
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(pipesDone)
+	waitErr := cmd.Wait()
+	exitCode := 0
+	if waitErr != nil {
+		var ee *exec.ExitError
+		if errors.As(waitErr, &ee) {
+			exitCode = ee.ExitCode()
+		} else {
+			exitCode = 1
+		}
+	}
+	sendExit(exitCode, "")
+	_ = remoteConn.Close()
+	<-stdinDone
 }
 
 func (c *Client) handlePowerCmd(sendFrame func(protocol.ControlFrame) error, closeConn func(), frame protocol.ControlFrame) {
@@ -885,6 +1079,156 @@ func PipeStdioToProxy(ctx context.Context, hubURL, token, nodeID string, cfHeade
 	err = <-errCh
 	_ = conn.Close()
 	return err
+}
+
+// RunInteractiveShell opens a direct interactive shell stream on a target node without requiring sshd.
+func RunInteractiveShell(ctx context.Context, hubURL, token, nodeID string, cols, rows int, stdin io.Reader, stdout io.Writer, cfHeaders ...map[string]string) error {
+	var extra map[string]string
+	if len(cfHeaders) > 0 {
+		extra = cfHeaders[0]
+	}
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	path := "/tunnel/client-shell?node_id=" + url.QueryEscape(nodeID)
+	if cols > 0 && rows > 0 {
+		path += fmt.Sprintf("&cols=%d&rows=%d", cols, rows)
+	}
+	conn, br, err := DialUpgradeWithHeaders(ctx, hubURL, path, token, "ssh-fleet-shell", extra)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+
+	if stdin != nil {
+		go func() {
+			_, _ = io.Copy(conn, stdin)
+		}()
+	}
+
+	_, copyErr := io.Copy(stdout, br)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return copyErr
+}
+
+// RunRemoteExec executes a non-interactive command on a target node over the agent tunnel,
+// streaming stdout/stderr separately and returning the remote exit code.
+func RunRemoteExec(ctx context.Context, hubURL, token, nodeID string, req protocol.ExecStartRequest, stdin io.Reader, stdout, stderr io.Writer, cfHeaders ...map[string]string) (int, error) {
+	var extra map[string]string
+	if len(cfHeaders) > 0 {
+		extra = cfHeaders[0]
+	}
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	path := "/tunnel/client-exec?node_id=" + url.QueryEscape(nodeID)
+	conn, br, err := DialUpgradeWithHeaders(ctx, hubURL, path, token, "ssh-fleet-exec", extra)
+	if err != nil {
+		return 1, err
+	}
+	defer conn.Close()
+
+	var writeM sync.Mutex
+	writeFrame := func(frameType byte, payload []byte) error {
+		writeM.Lock()
+		defer writeM.Unlock()
+		return protocol.WriteExecFrame(conn, frameType, payload)
+	}
+
+	startPayload, err := json.Marshal(req)
+	if err != nil {
+		return 2, err
+	}
+	if err := writeFrame(protocol.ExecFrameStart, startPayload); err != nil {
+		return 1, err
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = writeFrame(protocol.ExecFrameCancel, nil)
+			_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		case <-done:
+		}
+	}()
+
+	if stdin != nil {
+		go func() {
+			buf := make([]byte, 32*1024)
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				n, rErr := stdin.Read(buf)
+				if n > 0 {
+					if wErr := writeFrame(protocol.ExecFrameStdin, buf[:n]); wErr != nil {
+						return
+					}
+				}
+				if rErr != nil {
+					_ = writeFrame(protocol.ExecFrameEOF, nil)
+					return
+				}
+			}
+		}()
+	} else {
+		if err := writeFrame(protocol.ExecFrameEOF, nil); err != nil {
+			return 1, err
+		}
+	}
+
+	for {
+		ft, payload, rErr := protocol.ReadExecFrame(br)
+		if rErr != nil {
+			if ctx.Err() != nil {
+				return 130, ctx.Err()
+			}
+			return 1, rErr
+		}
+		switch ft {
+		case protocol.ExecFrameStdout:
+			if len(payload) > 0 {
+				if _, wErr := stdout.Write(payload); wErr != nil {
+					return 1, wErr
+				}
+			}
+		case protocol.ExecFrameStderr:
+			if len(payload) > 0 {
+				if _, wErr := stderr.Write(payload); wErr != nil {
+					return 1, wErr
+				}
+			}
+		case protocol.ExecFrameExit:
+			var exitPayload protocol.ExecExitPayload
+			if err := json.Unmarshal(payload, &exitPayload); err != nil {
+				return 1, fmt.Errorf("invalid exit payload: %w", err)
+			}
+			if exitPayload.Error != "" {
+				return exitPayload.Code, errors.New(exitPayload.Error)
+			}
+			return exitPayload.Code, nil
+		}
+	}
 }
 
 // GenerateServiceFile returns OS-native background service unit contents and target file path.

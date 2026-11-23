@@ -166,7 +166,7 @@ func TestDialClientSecurityAndEdgeCases(t *testing.T) {
 		t.Fatalf("expected error for colon in header key")
 	}
 
-	// 2. HTTP 401 returns *UpgradeError with StatusCode == 401.
+	// 2. HTTP 401 returns *UpgradeError with StatusCode == 401 and HTTP 502 surfaces error body.
 	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	}))
@@ -176,6 +176,23 @@ func TestDialClientSecurityAndEdgeCases(t *testing.T) {
 	var upErr *UpgradeError
 	if !errors.As(err, &upErr) || upErr.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected *UpgradeError 401, got %T: %v", err, err)
+	}
+
+	gwSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "local ssh port 22 unreachable", http.StatusBadGateway)
+	}))
+	defer gwSrv.Close()
+
+	_, err = DialClient(context.Background(), gwSrv.URL, "/", "tok", nil)
+	var gwErr *UpgradeError
+	if !errors.As(err, &gwErr) || gwErr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected *UpgradeError 502, got %T: %v", err, err)
+	}
+	if !strings.Contains(gwErr.Body, "local ssh port 22 unreachable") {
+		t.Fatalf("expected UpgradeError.Body to contain error reason, got %q", gwErr.Body)
+	}
+	if !strings.Contains(gwErr.Error(), "local ssh port 22 unreachable") {
+		t.Fatalf("expected UpgradeError.Error() to contain error reason, got %q", gwErr.Error())
 	}
 
 	// 3. Reject missing or mismatched Sec-WebSocket-Accept.

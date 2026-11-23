@@ -224,7 +224,8 @@ func pickAction(reader *bufio.Reader, target FleetTarget) (*SelectorChoice, erro
 		return &SelectorChoice{Target: target, Action: "ssh"}, nil
 	}
 	fmt.Printf("\nSelected %s (%s | %s):\n", target.Name, target.NodeID, target.PowerState)
-	fmt.Println("  [Enter / s] SSH Connect")
+	fmt.Println("  [Enter / a] Agent Shell (direct via fleet tunnel, no sshd needed)")
+	fmt.Println("  [s]         SSH Connect")
 	fmt.Println("  [w]         Wake (Soft-Wake or LAN Relay WoL)")
 	fmt.Println("  [z]         Soft-Sleep (screen off + lock, keep network alive)")
 	fmt.Println("  [H]         Hard-Sleep (OS Suspend-to-RAM)")
@@ -232,7 +233,7 @@ func pickAction(reader *bufio.Reader, target FleetTarget) (*SelectorChoice, erro
 	fmt.Println("  [k]         Keep-Awake ON")
 	fmt.Println("  [o]         Keep-Awake OFF")
 	fmt.Println("  [b]         Back")
-	fmt.Print("Action [s]: ")
+	fmt.Print("Action [a]: ")
 
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -240,7 +241,9 @@ func pickAction(reader *bufio.Reader, target FleetTarget) (*SelectorChoice, erro
 	}
 	act := strings.TrimSpace(line)
 	switch strings.ToLower(act) {
-	case "", "s":
+	case "", "a":
+		return &SelectorChoice{Target: target, Action: "shell"}, nil
+	case "s":
 		return &SelectorChoice{Target: target, Action: "ssh"}, nil
 	case "w":
 		return &SelectorChoice{Target: target, Action: "wake"}, nil
@@ -259,7 +262,7 @@ func pickAction(reader *bufio.Reader, target FleetTarget) (*SelectorChoice, erro
 		if act == "P" {
 			return &SelectorChoice{Target: target, Action: "poweroff"}, nil
 		}
-		return &SelectorChoice{Target: target, Action: "ssh"}, nil
+		return &SelectorChoice{Target: target, Action: "shell"}, nil
 	}
 }
 

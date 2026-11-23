@@ -15,8 +15,8 @@ Guidelines for coding agents working in `ssh-fleet`. Keep commits, docs, and com
 ## 2. Auth & Peer-Trust Model (Intentional — Do Not Break)
 This is a **personal peer-trust fleet**: all enrolled devices belong to one owner and share one Web control surface.
 - **`authNode` (`sfn_<nodeID>.<secret>`, issued via `/api/v1/join/exchange`)**:
-  - Intentionally allowed across nodes: `GET /api/v1/nodes`, `POST /api/v1/nodes/:id/power` (only when `keyring_password == ""`), `GET /tunnel/client-proxy`, and `GET`/`PUT /api/v1/vault`.
-  - **Do not** restrict `/api/v1/nodes/:id/power` (without `keyring_password`) or `/tunnel/client-proxy` to `authAdmin` or self-only unless explicitly requested.
+  - Intentionally allowed across nodes (full-mesh peer shell/exec + power): `GET /api/v1/nodes`, `POST /api/v1/nodes/:id/power` (only when `keyring_password == ""`), `GET /tunnel/client-proxy`, `GET /tunnel/client-shell`, `GET /tunnel/client-exec`, and `GET`/`PUT /api/v1/vault`.
+  - **Do not** restrict `/api/v1/nodes/:id/power` (without `keyring_password`), `/tunnel/client-proxy`, `/tunnel/client-shell`, or `/tunnel/client-exec` to `authAdmin` or self-only unless explicitly requested.
 - **Identity binding (`boundNodeID`)**:
   - `/tunnel/control`: `authNode` may register only `node_id == boundNodeID`.
   - `/tunnel/agent-stream`: `authNode` may attach only to pending streams owned by `boundNodeID` (`403` otherwise).

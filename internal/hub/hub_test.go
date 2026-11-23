@@ -2702,3 +2702,162 @@ func TestShellStreamClosesCleanlyOnWSDisconnect(t *testing.T) {
 		t.Fatalf("agent did not exit promptly after context cancel")
 	}
 }
+
+func TestFullMeshPeerExecAndShell(t *testing.T) {
+	const adminTok = "mesh-admin-tok"
+	srv, err := NewServer(adminTok, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewServer err: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer func() {
+		_ = srv.Close()
+		ts.Close()
+	}()
+
+	enrollNode := func(nodeID string) string {
+		jt, _ := srv.joinTokens.Create(5 * time.Minute)
+		body, _ := json.Marshal(map[string]string{"join_token": jt, "node_id": nodeID})
+		resp, err := http.Post(ts.URL+"/api/v1/join/exchange", "application/json", bytes.NewReader(body))
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("exchange %s failed: err=%v resp=%v", nodeID, err, resp)
+		}
+		var out struct {
+			NodeToken string `json:"node_token"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		_ = resp.Body.Close()
+		return out.NodeToken
+	}
+
+	tokA := enrollNode("peer-a")
+	tokB := enrollNode("peer-b")
+
+	notVPS := false
+	agB, err := agent.NewClient(agent.Options{
+		HubURL:       ts.URL,
+		Token:        tokB,
+		NodeID:       "peer-b",
+		Name:         "Peer B",
+		IsVPS:        &notVPS,
+		Power:        power.NewManager(&fakePowerExec{}),
+		PingInterval: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient peer-b err: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	agDone := make(chan error, 1)
+	go func() { agDone <- agB.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-agDone:
+		case <-time.After(3 * time.Second):
+		}
+		waitForNodeOnline(t, srv, "peer-b", false, 3*time.Second)
+	}()
+	waitForNodeOnline(t, srv, "peer-b", true, 3*time.Second)
+
+	// 1. Peer exec separates stdout and stderr and returns exit code 0.
+	execCtx, execCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer execCancel()
+	var stdout, stderr bytes.Buffer
+	code, err := agent.RunRemoteExec(execCtx, ts.URL, tokA, "peer-b", protocol.ExecStartRequest{
+		Command: "printf 'hello-out\\n'; printf 'hello-err\\n' >&2",
+	}, nil, &stdout, &stderr)
+	if err != nil || code != 0 {
+		t.Fatalf("RunRemoteExec stdout/stderr failed: code=%d err=%v stderr=%q", code, err, stderr.String())
+	}
+	if stdout.String() != "hello-out\n" {
+		t.Fatalf("unexpected stdout: %q", stdout.String())
+	}
+	if stderr.String() != "hello-err\n" {
+		t.Fatalf("unexpected stderr: %q", stderr.String())
+	}
+
+	// 2. Peer exec forwards stdin and closes it cleanly on EOF.
+	stdout.Reset()
+	stderr.Reset()
+	code, err = agent.RunRemoteExec(execCtx, ts.URL, tokA, "peer-b", protocol.ExecStartRequest{
+		Command: "cat",
+	}, strings.NewReader("piped-payload\n"), &stdout, &stderr)
+	if err != nil || code != 0 || stdout.String() != "piped-payload\n" {
+		t.Fatalf("RunRemoteExec stdin cat failed: code=%d err=%v stdout=%q stderr=%q", code, err, stdout.String(), stderr.String())
+	}
+
+	// 3. Peer exec preserves non-zero remote exit code.
+	stdout.Reset()
+	stderr.Reset()
+	code, err = agent.RunRemoteExec(execCtx, ts.URL, tokA, "peer-b", protocol.ExecStartRequest{
+		Command: "exit 7",
+	}, nil, &stdout, &stderr)
+	if err != nil || code != 7 {
+		t.Fatalf("expected exit code 7 and nil err, got code=%d err=%v", code, err)
+	}
+
+	// 4. Peer exec honors requested working directory.
+	workDir := t.TempDir()
+	wantDir, _ := filepath.EvalSymlinks(workDir)
+	stdout.Reset()
+	stderr.Reset()
+	code, err = agent.RunRemoteExec(execCtx, ts.URL, tokA, "peer-b", protocol.ExecStartRequest{
+		Command: "pwd",
+		Dir:     workDir,
+	}, nil, &stdout, &stderr)
+	if err != nil || code != 0 {
+		t.Fatalf("RunRemoteExec pwd failed: code=%d err=%v stderr=%q", code, err, stderr.String())
+	}
+	gotDir, _ := filepath.EvalSymlinks(strings.TrimSpace(stdout.String()))
+	if gotDir != wantDir {
+		t.Fatalf("expected remote pwd %q, got %q", wantDir, gotDir)
+	}
+
+	// 5. Peer interactive shell works across nodes using authNode token without sshd.
+	shellCtx, shellCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer shellCancel()
+	var shellOut bytes.Buffer
+	if err := agent.RunInteractiveShell(
+		shellCtx,
+		ts.URL,
+		tokA,
+		"peer-b",
+		80,
+		24,
+		strings.NewReader("echo PEER_SHELL_OK; exit\n"),
+		&shellOut,
+	); err != nil {
+		t.Fatalf("RunInteractiveShell failed: %v (output=%q)", err, shellOut.String())
+	}
+	if !strings.Contains(shellOut.String(), "PEER_SHELL_OK") {
+		t.Fatalf("expected PEER_SHELL_OK in shell output, got %q", shellOut.String())
+	}
+
+	// 6. Guardrails: unauthenticated -> 401, offline -> 503, bad node_id -> 400, web terminal stays authAdmin -> 403.
+	for _, tc := range []struct {
+		path string
+		tok  string
+		want int
+	}{
+		{"/tunnel/client-exec?node_id=peer-b", "", http.StatusUnauthorized},
+		{"/tunnel/client-shell?node_id=peer-b", "", http.StatusUnauthorized},
+		{"/tunnel/client-exec?node_id=missing-node", tokA, http.StatusServiceUnavailable},
+		{"/tunnel/client-shell?node_id=missing-node", tokA, http.StatusServiceUnavailable},
+		{"/tunnel/client-exec?node_id=bad.node", tokA, http.StatusBadRequest},
+		{"/tunnel/client-shell?node_id=bad.node", tokA, http.StatusBadRequest},
+		{"/api/v1/ws/terminal?mode=agent&node_id=peer-b", tokA, http.StatusForbidden},
+	} {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+tc.path, nil)
+		if tc.tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tc.tok)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s err: %v", tc.path, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Fatalf("%s expected %d, got %d", tc.path, tc.want, resp.StatusCode)
+		}
+	}
+}
