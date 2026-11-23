@@ -268,9 +268,25 @@ func TestHubEndToEndProxyPowerWoLAndVaultSync(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 
+	// Unbound offline laptop must refuse wake until manually bound to MAC + Wake Relay.
+	unboundRes := postPower("laptop-1", protocol.PowerRequest{Action: protocol.ActionWake})
+	if unboundRes.OK {
+		t.Fatalf("expected wake to fail when WoL is not bound, got %+v", unboundRes)
+	}
+
+	// Manually bind laptop-1 to home-pc-relay via PATCH /api/v1/nodes/laptop-1/wol
+	bindPayload := []byte(`{"wol":{"mac":"aa:bb:cc:dd:ee:01","broadcast_ip":"192.168.10.255","port":9,"wake_relay_id":"home-pc-relay"}}`)
+	bindReq, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/nodes/laptop-1/wol", bytes.NewReader(bindPayload))
+	bindReq.Header.Set("Authorization", "Bearer "+token)
+	bindResp, err := http.DefaultClient.Do(bindReq)
+	if err != nil || bindResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH wol bind failed: err=%v resp=%v", err, bindResp)
+	}
+	_ = bindResp.Body.Close()
+
 	wolWakeRes := postPower("laptop-1", protocol.PowerRequest{Action: protocol.ActionWake})
-	if !wolWakeRes.OK || wolWakeRes.Method != "wol-lan-relay" {
-		t.Fatalf("expected wol-lan-relay wake response, got %+v", wolWakeRes)
+	if !wolWakeRes.OK || wolWakeRes.Method != "wol-peer-relay" {
+		t.Fatalf("expected wol-peer-relay wake response, got %+v", wolWakeRes)
 	}
 	if len(wolWakeRes.Relays) != 1 || wolWakeRes.Relays[0] != "home-pc-relay" {
 		t.Fatalf("expected home-pc-relay to dispatch WoL, got %+v", wolWakeRes.Relays)
@@ -554,8 +570,26 @@ func TestVPSSleepProtectionAndESP32WakeRelay(t *testing.T) {
 		}
 	}
 
-	// 2. Connect a simulated ESP32 wake relay on /hub/ws/wake and wake an offline PC.
-	espConn, err := ws.DialClient(context.Background(), ts.URL, "/hub/ws/wake", token, nil)
+	// 2. Register an ESP32 wake relay via POST /api/v1/wake-relays and verify status tracking.
+	createRelayReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/wake-relays", bytes.NewReader([]byte(`{"name":"Home ESP32"}`)))
+	createRelayReq.Header.Set("Authorization", "Bearer "+token)
+	createRelayResp, err := http.DefaultClient.Do(createRelayReq)
+	if err != nil || createRelayResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create wake relay failed: err=%v resp=%v", err, createRelayResp)
+	}
+	var createdRelay struct {
+		OK    bool                        `json:"ok"`
+		Relay protocol.WakeRelaySummary `json:"relay"`
+		Token string                      `json:"token"`
+	}
+	_ = json.NewDecoder(createRelayResp.Body).Decode(&createdRelay)
+	_ = createRelayResp.Body.Close()
+	if !createdRelay.OK || createdRelay.Relay.ID != "home-esp32" || createdRelay.Relay.Online || !strings.HasPrefix(createdRelay.Token, "home-esp32.") {
+		t.Fatalf("unexpected created relay: %+v", createdRelay)
+	}
+
+	// Connect ESP32 using its dedicated <id>.<secret> token.
+	espConn, err := ws.DialClient(context.Background(), ts.URL, "/hub/ws/wake", createdRelay.Token, nil)
 	if err != nil {
 		t.Fatalf("DialClient /hub/ws/wake: %v", err)
 	}
@@ -563,8 +597,24 @@ func TestVPSSleepProtectionAndESP32WakeRelay(t *testing.T) {
 
 	_ = espConn.WriteText(`{"t":"hello","firmwareVersion":"1.0.0"}`)
 	_, ackRaw, err := espConn.ReadMessage()
-	if err != nil || !strings.Contains(string(ackRaw), `"hello-ack"`) {
-		t.Fatalf("expected hello-ack from /hub/ws/wake, got %q (err=%v)", ackRaw, err)
+	if err != nil || !strings.Contains(string(ackRaw), `"home-esp32"`) {
+		t.Fatalf("expected hello-ack with home-esp32 from /hub/ws/wake, got %q (err=%v)", ackRaw, err)
+	}
+
+	// Check GET /api/v1/wake-relays shows online=true and firmware_version=1.0.0.
+	listReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/wake-relays", nil)
+	listReq.Header.Set("Authorization", "Bearer "+token)
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil || listResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/v1/wake-relays failed: err=%v resp=%v", err, listResp)
+	}
+	var listOut struct {
+		WakeRelays []protocol.WakeRelaySummary `json:"wake_relays"`
+	}
+	_ = json.NewDecoder(listResp.Body).Decode(&listOut)
+	_ = listResp.Body.Close()
+	if len(listOut.WakeRelays) != 1 || !listOut.WakeRelays[0].Online || listOut.WakeRelays[0].FirmwareVersion != "1.0.0" {
+		t.Fatalf("expected home-esp32 online with fw 1.0.0, got %+v", listOut.WakeRelays)
 	}
 
 	espWakeReceived := make(chan string, 1)
@@ -591,23 +641,76 @@ func TestVPSSleepProtectionAndESP32WakeRelay(t *testing.T) {
 		}
 	}()
 
-	wakeBody, _ := json.Marshal(protocol.PowerRequest{
-		Action:      protocol.ActionWake,
-		MAC:         "9c:6b:00:13:9e:b3",
-		BroadcastIP: "192.168.1.255",
+	// Register a non-VPS home-pc, disconnect it, and test manual WoL binding requirement.
+	notVPS := false
+	pcAgent, _ := agent.NewClient(agent.Options{
+		HubURL:       ts.URL,
+		Token:        token,
+		NodeID:       "home-pc",
+		Name:         "home-pc",
+		IsVPS:        &notVPS,
+		PingInterval: 5 * time.Second,
 	})
-	wakeReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/offline-home-pc/power", bytes.NewReader(wakeBody))
+	pcCtx, pcCancel := context.WithCancel(context.Background())
+	go func() { _ = pcAgent.Run(pcCtx) }()
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		foundOnline := false
+		for _, n := range srv.ListNodes() {
+			if n.NodeID == "home-pc" && n.Online {
+				foundOnline = true
+			}
+		}
+		if foundOnline {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	pcCancel()
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		stillOnline := true
+		for _, n := range srv.ListNodes() {
+			if n.NodeID == "home-pc" {
+				stillOnline = n.Online
+			}
+		}
+		if !stillOnline {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Unbound -> 400 Bad Request
+	wakeBody, _ := json.Marshal(protocol.PowerRequest{Action: protocol.ActionWake})
+	wakeReq0, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/home-pc/power", bytes.NewReader(wakeBody))
+	wakeReq0.Header.Set("Authorization", "Bearer "+token)
+	wakeResp0, _ := http.DefaultClient.Do(wakeReq0)
+	_ = wakeResp0.Body.Close()
+	if wakeResp0.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unbound home-pc wake, got %d", wakeResp0.StatusCode)
+	}
+
+	// Bind home-pc to home-esp32 manually
+	bindReq, _ := http.NewRequest(http.MethodPatch, ts.URL+"/api/v1/nodes/home-pc/wol", bytes.NewReader([]byte(`{"wol":{"mac":"9c:6b:00:13:9e:b3","broadcast_ip":"192.168.1.255","port":9,"wake_relay_id":"home-esp32"}}`)))
+	bindReq.Header.Set("Authorization", "Bearer "+token)
+	bindResp, err := http.DefaultClient.Do(bindReq)
+	if err != nil || bindResp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH home-pc wol failed: err=%v resp=%v", err, bindResp)
+	}
+	_ = bindResp.Body.Close()
+
+	// Wake succeeds via bound home-esp32
+	wakeReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/home-pc/power", bytes.NewReader(wakeBody))
 	wakeReq.Header.Set("Authorization", "Bearer "+token)
 	wakeResp, err := http.DefaultClient.Do(wakeReq)
 	if err != nil {
-		t.Fatalf("wake offline PC err: %v", err)
+		t.Fatalf("wake home-pc err: %v", err)
 	}
 	var wakeOut protocol.PowerResponse
 	_ = json.NewDecoder(wakeResp.Body).Decode(&wakeOut)
 	_ = wakeResp.Body.Close()
 
-	if !wakeOut.OK || wakeOut.Method != "wol-lan-relay" || len(wakeOut.Relays) != 1 || !strings.HasPrefix(wakeOut.Relays[0], "esp32-") {
-		t.Fatalf("expected ESP32 wake relay success, got %+v", wakeOut)
+	if !wakeOut.OK || wakeOut.Method != "wol-esp32-relay" || len(wakeOut.Relays) != 1 || wakeOut.Relays[0] != "home-esp32" {
+		t.Fatalf("expected home-esp32 wake relay success, got %+v", wakeOut)
 	}
 	select {
 	case mac := <-espWakeReceived:
@@ -616,5 +719,22 @@ func TestVPSSleepProtectionAndESP32WakeRelay(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("ESP32 did not receive wake command")
+	}
+
+	// Disconnect ESP32 -> Wake returns 503 Service Unavailable
+	_ = espConn.Close()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		relays := srv.ListWakeRelays()
+		if len(relays) == 1 && !relays[0].Online {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	wakeReqOff, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/home-pc/power", bytes.NewReader(wakeBody))
+	wakeReqOff.Header.Set("Authorization", "Bearer "+token)
+	wakeRespOff, _ := http.DefaultClient.Do(wakeReqOff)
+	_ = wakeRespOff.Body.Close()
+	if wakeRespOff.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when bound ESP32 relay is offline, got %d", wakeRespOff.StatusCode)
 	}
 }

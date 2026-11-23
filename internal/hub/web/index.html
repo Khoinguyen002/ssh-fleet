@@ -194,6 +194,7 @@
       <span id="relayBadge" class="badge" style="display:none;">WoL Relays: 0</span>
     </div>
     <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <button id="relayPanelBtn" onclick="toggleRelayPanel()" style="display:none;">📡 Wake Relays</button>
       <button id="connectBtn" class="primary" onclick="toggleConnectPanel()" style="display:none;">➕ Connect Device</button>
       <button id="vaultBtn" onclick="openVaultModal()">🔐 Unlock Vault</button>
       <button onclick="refreshAll()">↻ Refresh</button>
@@ -236,12 +237,45 @@
       </div>
     </div>
 
+    <div id="relayPanel" class="card" style="display:none; margin-bottom:14px;">
+      <div class="card-head">
+        <div>
+          <div class="card-title">📡 Wake Relays (ESP32)</div>
+          <div class="card-sub">Always-on LAN relay to wake sleeping machines. Register a relay, flash its one-time token into <code>esp32-wake</code>, then bind it to a device below.</div>
+        </div>
+        <button onclick="toggleRelayPanel(false)">✕</button>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <input id="newRelayName" type="text" placeholder="Relay name (e.g. Home ESP32)..." onkeydown="if(event.key==='Enter') createWakeRelay()" />
+        <button class="primary" onclick="createWakeRelay()">+ Add Relay</button>
+      </div>
+      <div id="relayTokenCard" class="code-box" style="display:none; border-color:var(--amber);"></div>
+      <div id="relayList" style="display:flex; flex-direction:column; gap:8px;"></div>
+    </div>
+
     <div class="controls">
       <input id="searchInput" type="search" placeholder="Fuzzy search host, IP, OS, power state, tags..." oninput="renderFleet()" />
     </div>
 
     <div id="fleetGrid" class="grid"></div>
   </main>
+
+  <div id="wolModal" class="modal-backdrop">
+    <div class="modal">
+      <div style="font-size:16px; font-weight:700;">⚙ Bind Wake-on-LAN (<span id="wolNodeTitle"></span>)</div>
+      <div class="card-sub">Manually bind the target physical MAC address and Wake Relay. A device is only wakeable from sleep/off after binding both.</div>
+      <input id="wolMacInput" type="text" placeholder="MAC Address (e.g. 9c:6b:00:13:9e:b3)" />
+      <input id="wolBcastInput" type="text" placeholder="Broadcast IP (optional, e.g. 192.168.1.255)" />
+      <select id="wolRelaySelect" style="background:var(--surface-2); color:var(--text); padding:10px 12px; border-radius:10px; border:1px solid var(--border); font:inherit;"></select>
+      <div style="display:flex; gap:8px; justify-content:space-between; flex-wrap:wrap;">
+        <button class="danger" onclick="saveWolBinding(true)">Unbind</button>
+        <div style="display:flex; gap:8px;">
+          <button onclick="closeWolModal()">Cancel</button>
+          <button class="primary" onclick="saveWolBinding(false)">Save Binding</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <div id="vaultModal" class="modal-backdrop">
     <div class="modal">
@@ -293,10 +327,12 @@
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <script>
     let hubNodes = [];
+    let wakeRelays = [];
     let vaultData = null;
     let bearerToken = localStorage.getItem('sf_token') || '';
     let realHubToken = '';
     let redactedHubToken = 'sf_••••';
+    let wolTargetNodeId = '';
     let activeWS = null;
     let term = null;
     let fitAddon = null;
@@ -364,10 +400,13 @@
     async function refreshAll() {
       const ok = await checkAuth();
       document.getElementById('connectBtn').style.display = ok ? 'inline-block' : 'none';
+      document.getElementById('relayPanelBtn').style.display = ok ? 'inline-block' : 'none';
       if (!ok) {
         hubNodes = [];
+        wakeRelays = [];
         realHubToken = '';
         document.getElementById('connectPanel').style.display = 'none';
+        document.getElementById('relayPanel').style.display = 'none';
         renderFleet();
         return;
       }
@@ -379,22 +418,120 @@
         if (!nodesRes.ok) throw new Error('HTTP ' + nodesRes.status);
         const data = await nodesRes.json();
         hubNodes = data.nodes || [];
+        wakeRelays = data.wake_relays || [];
+        renderWakeRelays();
         if (infoRes.ok) {
           const info = await infoRes.json();
           realHubToken = info.hub_token || '';
           redactedHubToken = info.hub_token_redacted || 'sf_••••';
+          const onlineESP = wakeRelays.filter(r => r.online).length;
           const onlinePeers = hubNodes.filter(n => n.online && !n.is_vps).length;
-          const totalRelays = (info.esp32_relays_online || 0) + onlinePeers;
           const rb = document.getElementById('relayBadge');
           rb.style.display = 'inline-block';
-          rb.textContent = `WoL Relays: ${totalRelays}` + (info.esp32_relays_online ? ` (${info.esp32_relays_online} ESP32)` : '');
-          rb.className = totalRelays > 0 ? 'badge ok' : 'badge warn';
+          rb.textContent = `ESP32 Relays: ${onlineESP}/${wakeRelays.length}` + (onlinePeers ? ` · Peers: ${onlinePeers}` : '');
+          rb.className = onlineESP > 0 ? 'badge ok' : 'badge warn';
           renderConnectScripts();
         }
       } catch (e) {
         showToast('Failed to fetch nodes: ' + e.message);
       }
       renderFleet();
+    }
+
+    function toggleRelayPanel(force) {
+      const panel = document.getElementById('relayPanel');
+      const show = typeof force === 'boolean' ? force : panel.style.display === 'none';
+      panel.style.display = show ? 'flex' : 'none';
+      if (show) renderWakeRelays();
+    }
+
+    function renderWakeRelays() {
+      const el = document.getElementById('relayList');
+      if (!el) return;
+      if (!wakeRelays.length) {
+        el.innerHTML = '<div class="card-sub">No ESP32 wake relays registered yet.</div>';
+        return;
+      }
+      el.innerHTML = wakeRelays.map(r => {
+        const cls = r.online ? 'badge ok' : 'badge off';
+        const status = r.online ? 'ONLINE' : 'OFFLINE';
+        const meta = [r.id, r.firmware_version ? 'fw ' + r.firmware_version : '', r.last_seen_at ? 'seen ' + new Date(r.last_seen_at).toLocaleString() : 'never connected'].filter(Boolean).join(' · ');
+        return `
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 10px; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; flex-wrap:wrap;">
+            <div>
+              <div style="font-weight:600; font-size:13px;">${esc(r.name)} <span class="${cls}" style="margin-left:6px;">${status}</span></div>
+              <div class="card-sub">${esc(meta)}</div>
+            </div>
+            <div style="display:flex; gap:6px;">
+              <button onclick="rotateWakeRelay('${escAttr(r.id)}')">↻ Rotate</button>
+              <button class="danger" onclick="deleteWakeRelay('${escAttr(r.id)}','${escAttr(r.name)}')">Delete</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function createWakeRelay() {
+      const input = document.getElementById('newRelayName');
+      const name = input.value.trim();
+      if (!name) return;
+      try {
+        const res = await fetch('/api/v1/wake-relays', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          credentials: 'include',
+          body: JSON.stringify({ name })
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'failed');
+        input.value = '';
+        showRelayTokenCard(data.relay.name, data.token, data.ws_path);
+        await refreshAll();
+      } catch (e) {
+        showToast('Add relay failed: ' + e.message);
+      }
+    }
+
+    async function rotateWakeRelay(id) {
+      if (!confirm(`Rotate token for wake relay "${id}"? Existing ESP32 will disconnect until reflashed.`)) return;
+      try {
+        const res = await fetch(`/api/v1/wake-relays/${encodeURIComponent(id)}/rotate`, {
+          method: 'POST',
+          headers: authHeaders(),
+          credentials: 'include'
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'failed');
+        showRelayTokenCard(data.relay.name, data.token, data.ws_path);
+        await refreshAll();
+      } catch (e) {
+        showToast('Rotate failed: ' + e.message);
+      }
+    }
+
+    async function deleteWakeRelay(id, name) {
+      if (!confirm(`Delete wake relay "${name}"?`)) return;
+      try {
+        const res = await fetch(`/api/v1/wake-relays/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+          headers: authHeaders(),
+          credentials: 'include'
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'failed');
+        showToast('Deleted wake relay ' + name);
+        await refreshAll();
+      } catch (e) {
+        showToast('Delete failed: ' + e.message);
+      }
+    }
+
+    function showRelayTokenCard(name, token, wsPath) {
+      const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const card = document.getElementById('relayTokenCard');
+      card.style.display = 'block';
+      card.textContent = `One-time token for "${name}" (save into esp32-wake/config.h):\nWebSocket: ${wsProto}//${location.host}${wsPath}\nWAKE_AGENT_TOKEN: ${token}`;
+      showToast('Wake relay token created — copy it from the yellow box!');
     }
 
     function buildJoinScript(kind, tokenVal) {
@@ -526,9 +663,12 @@
             online: n ? Boolean(n.online) : true,
             isVps: n ? Boolean(n.is_vps) : true,
             powerState: n ? n.power_state : (h.via_hub ? 'offline' : 'static'),
-            mac: h.mac || (n && n.mac_addrs && n.mac_addrs[0]) || '',
-            broadcastIp: h.broadcast_ip || (n && n.broadcast_ip) || '',
-            relayNodeId: h.relay_node_id || '',
+            mac: (n && n.wol && n.wol.mac) || h.mac || '',
+            detectedMac: (n && n.mac_addrs && n.mac_addrs[0]) || '',
+            broadcastIp: (n && n.wol && n.wol.broadcast_ip) || h.broadcast_ip || '',
+            detectedBroadcast: (n && n.broadcast_ip) || '',
+            relayNodeId: (n && n.wol && n.wol.wake_relay_id) || h.relay_node_id || '',
+            wolBound: Boolean(n && n.wol && n.wol.mac && n.wol.wake_relay_id),
             tags: h.tags || []
           });
         }
@@ -548,12 +688,78 @@
           online: Boolean(n.online),
           isVps: Boolean(n.is_vps),
           powerState: n.power_state || (n.online ? 'active' : 'offline'),
-          mac: (n.mac_addrs && n.mac_addrs[0]) || '',
-          broadcastIp: n.broadcast_ip || '',
+          mac: (n.wol && n.wol.mac) || '',
+          detectedMac: (n.mac_addrs && n.mac_addrs[0]) || '',
+          broadcastIp: (n.wol && n.wol.broadcast_ip) || '',
+          detectedBroadcast: n.broadcast_ip || '',
+          relayNodeId: (n.wol && n.wol.wake_relay_id) || '',
+          wolBound: Boolean(n.wol && n.wol.mac && n.wol.wake_relay_id),
           tags: []
         });
       }
       return list;
+    }
+
+    function relayStatusLabel(relayId) {
+      if (!relayId) return null;
+      const esp = wakeRelays.find(r => r.id === relayId);
+      if (esp) return { name: esp.name, online: esp.online };
+      const peer = hubNodes.find(n => n.node_id === relayId);
+      if (peer) return { name: peer.name || peer.node_id, online: peer.online };
+      return { name: relayId, online: false };
+    }
+
+    function openWolModal(nodeId) {
+      const item = (window._renderedItems || []).find(x => x.nodeId === nodeId);
+      if (!item) return;
+      wolTargetNodeId = nodeId;
+      document.getElementById('wolNodeTitle').textContent = item.name;
+      document.getElementById('wolMacInput').value = item.mac || item.detectedMac || '';
+      document.getElementById('wolBcastInput').value = item.broadcastIp || item.detectedBroadcast || '';
+
+      const sel = document.getElementById('wolRelaySelect');
+      const opts = ['<option value="">-- Select Wake Relay --</option>'];
+      for (const r of wakeRelays) {
+        const selected = item.relayNodeId === r.id ? 'selected' : '';
+        opts.push(`<option value="${escAttr(r.id)}" ${selected}>[ESP32] ${esc(r.name)} (${r.online ? 'ONLINE' : 'OFFLINE'})</option>`);
+      }
+      for (const n of hubNodes) {
+        if (n.is_vps || n.node_id === nodeId) continue;
+        const selected = item.relayNodeId === n.node_id ? 'selected' : '';
+        opts.push(`<option value="${escAttr(n.node_id)}" ${selected}>[Peer PC] ${esc(n.name || n.node_id)} (${n.online ? 'ONLINE' : 'OFFLINE'})</option>`);
+      }
+      sel.innerHTML = opts.join('');
+      document.getElementById('wolModal').classList.add('open');
+    }
+
+    function closeWolModal() {
+      document.getElementById('wolModal').classList.remove('open');
+      wolTargetNodeId = '';
+    }
+
+    async function saveWolBinding(unbind) {
+      if (!wolTargetNodeId) return;
+      const mac = document.getElementById('wolMacInput').value.trim();
+      const bcast = document.getElementById('wolBcastInput').value.trim();
+      const relayId = document.getElementById('wolRelaySelect').value.trim();
+      const payload = unbind ? { wol: null } : {
+        wol: { mac, broadcast_ip: bcast, port: 9, wake_relay_id: relayId }
+      };
+      try {
+        const res = await fetch(`/api/v1/nodes/${encodeURIComponent(wolTargetNodeId)}/wol`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          credentials: 'include',
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'failed');
+        closeWolModal();
+        showToast(unbind ? 'Unbound Wake-on-LAN' : 'Saved Wake-on-LAN binding');
+        await refreshAll();
+      } catch (e) {
+        showToast('Bind WoL error: ' + e.message);
+      }
     }
 
     function renderFleet() {
@@ -574,9 +780,14 @@
       grid.innerHTML = items.map((t, idx) => {
         const badgeClass = t.kind === 'vps' ? 'badge' : (t.online ? 'badge ok' : 'badge off');
         const stateText = t.kind === 'vps' ? 'VPS' : (t.isVps ? (t.online ? '☁️ VPS · ON' : '☁️ VPS · OFF') : (t.online ? `ON · ${t.powerState}` : `OFF · ${t.powerState}`));
-        const sub = [t.user ? `${t.user}@${t.host}` : t.host, t.os, t.mac].filter(Boolean).join(' · ');
+        const relayInfo = t.wolBound ? relayStatusLabel(t.relayNodeId) : null;
+        const wolLine = (t.kind === 'hub-device' && !t.isVps)
+          ? (t.wolBound ? `WoL: ${t.mac} via ${relayInfo.name} (${relayInfo.online ? 'Relay ON' : 'Relay OFF'})` : 'WoL: Not bound (click ⚙ WoL to bind)')
+          : '';
+        const sub = [t.user ? `${t.user}@${t.host}` : t.host, t.os, wolLine].filter(Boolean).join(' · ');
         const isKeepAwake = t.powerState === 'keep-awake';
         const allowPowerCtrl = t.kind === 'hub-device' && !t.isVps;
+        const canWake = t.online || (t.wolBound && relayInfo && relayInfo.online);
 
         return `
           <div class="card">
@@ -590,7 +801,8 @@
             <div class="actions">
               ${t.kind === 'hub-device' && t.online ? `<button class="primary" onclick="openAgentTerminal('${escAttr(t.nodeId)}','${escAttr(t.name)}')">>_ Shell</button>` : ''}
               ${(t.kind === 'vps' || t.online) ? `<button onclick="openSSHTerminal(${idx})">SSH</button>` : ''}
-              ${allowPowerCtrl ? `<button class="wake" onclick="sendPower('${escAttr(t.nodeId)}','wake','${escAttr(t.mac)}','${escAttr(t.broadcastIp)}','${escAttr(t.relayNodeId)}')">⚡ Wake</button>` : ''}
+              ${allowPowerCtrl ? `<button class="wake" ${canWake ? '' : 'disabled style="opacity:0.45;cursor:not-allowed;"'} onclick="sendPower('${escAttr(t.nodeId)}','wake')">${canWake ? '⚡ Wake' : (t.wolBound ? '⚡ Relay Offline' : '⚡ Unbound')}</button>` : ''}
+              ${allowPowerCtrl ? `<button onclick="openWolModal('${escAttr(t.nodeId)}')">⚙ WoL</button>` : ''}
               ${allowPowerCtrl && t.online ? `<button class="sleep" onclick="sendPower('${escAttr(t.nodeId)}','soft-sleep')">🌙 Soft Sleep</button>` : ''}
               ${allowPowerCtrl && t.online ? `<button onclick="sendPower('${escAttr(t.nodeId)}','${isKeepAwake ? 'keep-awake-off' : 'keep-awake-on'}')">☕ ${isKeepAwake ? 'Awake ON' : 'Keep Awake'}</button>` : ''}
               ${allowPowerCtrl && t.online ? `<button class="danger" onclick="confirmHardSleep('${escAttr(t.nodeId)}','${escAttr(t.name)}')">💤 Hard Sleep</button>` : ''}

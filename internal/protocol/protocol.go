@@ -22,23 +22,40 @@ const (
 	ActionWake         PowerAction = "wake"
 )
 
+type NodeWolConfig struct {
+	MAC         string `json:"mac"`
+	BroadcastIP string `json:"broadcast_ip,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	WakeRelayID string `json:"wake_relay_id"`
+}
+
+type WakeRelaySummary struct {
+	ID              string     `json:"id"`
+	Name            string     `json:"name"`
+	Online          bool       `json:"online"`
+	FirmwareVersion string     `json:"firmware_version,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	LastSeenAt      *time.Time `json:"last_seen_at,omitempty"`
+}
+
 type NodeInfo struct {
-	NodeID      string     `json:"node_id"`
-	Name        string     `json:"name"`
-	Hostname    string     `json:"hostname"`
-	OS          string     `json:"os"`
-	Arch        string     `json:"arch"`
-	SSHUser     string     `json:"ssh_user"`
-	SSHPort     int        `json:"ssh_port"`
-	LocalIPs    []string   `json:"local_ips,omitempty"`
-	SubnetCIDRs []string   `json:"subnet_cidrs,omitempty"`
-	MACAddrs    []string   `json:"mac_addrs,omitempty"`
-	BroadcastIP string     `json:"broadcast_ip,omitempty"`
-	PowerState  PowerState `json:"power_state"`
-	Online      bool       `json:"online"`
-	IsVPS       bool       `json:"is_vps,omitempty"`
-	ConnectedAt time.Time  `json:"connected_at,omitempty"`
-	LastSeen    time.Time  `json:"last_seen"`
+	NodeID      string         `json:"node_id"`
+	Name        string         `json:"name"`
+	Hostname    string         `json:"hostname"`
+	OS          string         `json:"os"`
+	Arch        string         `json:"arch"`
+	SSHUser     string         `json:"ssh_user"`
+	SSHPort     int            `json:"ssh_port"`
+	LocalIPs    []string       `json:"local_ips,omitempty"`
+	SubnetCIDRs []string       `json:"subnet_cidrs,omitempty"`
+	MACAddrs    []string       `json:"mac_addrs,omitempty"`
+	BroadcastIP string         `json:"broadcast_ip,omitempty"`
+	PowerState  PowerState     `json:"power_state"`
+	Online      bool           `json:"online"`
+	IsVPS       bool           `json:"is_vps,omitempty"`
+	WoL         *NodeWolConfig `json:"wol,omitempty"`
+	ConnectedAt time.Time      `json:"connected_at,omitempty"`
+	LastSeen    time.Time      `json:"last_seen"`
 }
 
 // ControlFrame represents a single newline-delimited JSON message over the Hub <-> Agent control channel.
