@@ -78,10 +78,33 @@ type pendingAck struct {
 }
 
 type Options struct {
-	Token         string
-	DataDir       string
-	TrustCFAccess bool
-	CFAccessEmail string
+	Token            string
+	DataDir          string
+	TrustCFAccess    bool
+	CFAccessEmail    string
+	AgentReadTimeout time.Duration
+	ESP32ReadTimeout time.Duration
+	SoftWakeTimeout  time.Duration
+	KeyringUnlockTTL time.Duration
+}
+
+type authRole int
+
+const (
+	authNone authRole = iota
+	authNode
+	authAdmin
+)
+
+type pendingKeyringUnlock struct {
+	password  string
+	expiresAt time.Time
+	timer     *time.Timer
+}
+
+type keyringUnlockStatus struct {
+	pending bool
+	err     string
 }
 
 type esp32WakeRelay struct {
@@ -104,20 +127,26 @@ func (r *esp32WakeRelay) close() {
 }
 
 type Server struct {
-	token         string
-	dataDir       string
-	trustCFAccess bool
-	cfEmails      []string
-	wakeReg       *WakeRelayRegistry
-	joinTokens    *JoinTokenStore
-	nodeCreds     *NodeCredStore
-	mu            sync.RWMutex
-	nodes         map[string]*protocol.NodeInfo
-	agents        map[string]*activeAgent
-	esp32Relays   map[string]*esp32WakeRelay
-	pendingReq    map[string]*pendingAck
-	streams       map[string]chan net.Conn
-	httpSrv       *http.Server
+	token                 string
+	dataDir               string
+	trustCFAccess         bool
+	cfEmails              []string
+	agentReadTimeout      time.Duration
+	esp32ReadTimeout      time.Duration
+	softWakeTimeout       time.Duration
+	keyringUnlockTTL      time.Duration
+	wakeReg               *WakeRelayRegistry
+	joinTokens            *JoinTokenStore
+	nodeCreds             *NodeCredStore
+	mu                    sync.RWMutex
+	nodes                 map[string]*protocol.NodeInfo
+	agents                map[string]*activeAgent
+	esp32Relays           map[string]*esp32WakeRelay
+	pendingReq            map[string]*pendingAck
+	pendingKeyringUnlocks map[string]*pendingKeyringUnlock
+	keyringStatus         map[string]keyringUnlockStatus
+	streams               map[string]chan net.Conn
+	httpSrv               *http.Server
 }
 
 func NewServer(token, dataDir string) (*Server, error) {
@@ -136,6 +165,18 @@ func NewServerWithOptions(opts Options) (*Server, error) {
 			return nil, err
 		}
 	}
+	if opts.AgentReadTimeout <= 0 {
+		opts.AgentReadTimeout = 45 * time.Second
+	}
+	if opts.ESP32ReadTimeout <= 0 {
+		opts.ESP32ReadTimeout = 90 * time.Second
+	}
+	if opts.SoftWakeTimeout <= 0 {
+		opts.SoftWakeTimeout = 3 * time.Second
+	}
+	if opts.KeyringUnlockTTL <= 0 {
+		opts.KeyringUnlockTTL = 5 * time.Minute
+	}
 	var emails []string
 	for _, e := range strings.Split(opts.CFAccessEmail, ",") {
 		e = strings.ToLower(strings.TrimSpace(e))
@@ -145,18 +186,24 @@ func NewServerWithOptions(opts Options) (*Server, error) {
 	}
 	trustCF := opts.TrustCFAccess || len(emails) > 0
 	s := &Server{
-		token:         opts.Token,
-		dataDir:       opts.DataDir,
-		trustCFAccess: trustCF,
-		cfEmails:      emails,
-		wakeReg:       NewWakeRelayRegistry(opts.DataDir),
-		joinTokens:    NewJoinTokenStore(),
-		nodeCreds:     NewNodeCredStore(opts.DataDir),
-		nodes:         make(map[string]*protocol.NodeInfo),
-		agents:        make(map[string]*activeAgent),
-		esp32Relays:   make(map[string]*esp32WakeRelay),
-		pendingReq:    make(map[string]*pendingAck),
-		streams:       make(map[string]chan net.Conn),
+		token:                 opts.Token,
+		dataDir:               opts.DataDir,
+		trustCFAccess:         trustCF,
+		cfEmails:              emails,
+		agentReadTimeout:      opts.AgentReadTimeout,
+		esp32ReadTimeout:      opts.ESP32ReadTimeout,
+		softWakeTimeout:       opts.SoftWakeTimeout,
+		keyringUnlockTTL:      opts.KeyringUnlockTTL,
+		wakeReg:               NewWakeRelayRegistry(opts.DataDir),
+		joinTokens:            NewJoinTokenStore(),
+		nodeCreds:             NewNodeCredStore(opts.DataDir),
+		nodes:                 make(map[string]*protocol.NodeInfo),
+		agents:                make(map[string]*activeAgent),
+		esp32Relays:           make(map[string]*esp32WakeRelay),
+		pendingReq:            make(map[string]*pendingAck),
+		pendingKeyringUnlocks: make(map[string]*pendingKeyringUnlock),
+		keyringStatus:         make(map[string]keyringUnlockStatus),
+		streams:               make(map[string]chan net.Conn),
 	}
 	s.loadPersistedNodes()
 	return s, nil
@@ -170,14 +217,14 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/api/v1/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("/api/v1/auth/login", s.handleAuthLogin)
-	mux.HandleFunc("/api/v1/hub-info", s.withAuth(s.handleHubInfo))
-	mux.HandleFunc("/api/v1/join-tokens", s.withAuth(s.handleCreateJoinToken))
+	mux.HandleFunc("/api/v1/hub-info", s.withAdminAuth(s.handleHubInfo))
+	mux.HandleFunc("/api/v1/join-tokens", s.withAdminAuth(s.handleCreateJoinToken))
 	mux.HandleFunc("/api/v1/join/exchange", s.handleJoinExchange)
-	mux.HandleFunc("/api/v1/ws/terminal", s.withAuth(s.handleTerminalWS))
+	mux.HandleFunc("/api/v1/ws/terminal", s.withAdminAuth(s.handleTerminalWS))
 	mux.HandleFunc("/api/v1/nodes", s.withAuth(s.handleListNodes))
 	mux.HandleFunc("/api/v1/nodes/", s.withAuth(s.handleNodeAction))
-	mux.HandleFunc("/api/v1/wake-relays", s.withAuth(s.handleWakeRelays))
-	mux.HandleFunc("/api/v1/wake-relays/", s.withAuth(s.handleWakeRelayByID))
+	mux.HandleFunc("/api/v1/wake-relays", s.withAdminAuth(s.handleWakeRelays))
+	mux.HandleFunc("/api/v1/wake-relays/", s.withAdminAuth(s.handleWakeRelayByID))
 	mux.HandleFunc("/api/v1/vault", s.withAuth(s.handleVault))
 	mux.HandleFunc("/tunnel/control", s.withAuth(s.handleControlTunnel))
 	mux.HandleFunc("/tunnel/agent-stream", s.withAuth(s.handleAgentStream))
@@ -204,6 +251,16 @@ func (s *Server) Close() error {
 	for _, er := range s.esp32Relays {
 		er.close()
 	}
+	for id, p := range s.pendingKeyringUnlocks {
+		if p.timer != nil {
+			p.timer.Stop()
+		}
+		p.password = ""
+		delete(s.pendingKeyringUnlocks, id)
+	}
+	for id := range s.keyringStatus {
+		delete(s.keyringStatus, id)
+	}
 	s.mu.Unlock()
 	if s.httpSrv != nil {
 		return s.httpSrv.Close()
@@ -211,33 +268,35 @@ func (s *Server) Close() error {
 	return nil
 }
 
-func (s *Server) isTokenValid(tok string) bool {
+func (s *Server) classifyToken(tok string) (authRole, string) {
 	if subtle.ConstantTimeCompare([]byte(tok), []byte(s.token)) == 1 {
-		return true
+		return authAdmin, ""
 	}
-	_, ok := s.nodeCreds.Verify(tok)
-	return ok
+	if nodeID, ok := s.nodeCreds.Verify(tok); ok {
+		return authNode, nodeID
+	}
+	return authNone, ""
 }
 
-func (s *Server) isAuthorized(r *http.Request) (bool, string) {
+func (s *Server) authenticateRequest(r *http.Request) (authRole, string) {
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
 	const prefix = "Bearer "
 	if strings.HasPrefix(auth, prefix) {
 		got := strings.TrimPrefix(auth, prefix)
-		if s.isTokenValid(got) {
-			return true, ""
+		if role, sub := s.classifyToken(got); role != authNone {
+			return role, sub
 		}
 	}
 
 	if c, err := r.Cookie("sf_token"); err == nil && c.Value != "" {
-		if s.isTokenValid(c.Value) {
-			return true, ""
+		if role, sub := s.classifyToken(c.Value); role != authNone {
+			return role, sub
 		}
 	}
 
 	if qTok := strings.TrimSpace(r.URL.Query().Get("token")); qTok != "" {
-		if s.isTokenValid(qTok) {
-			return true, ""
+		if role, sub := s.classifyToken(qTok); role != authNone {
+			return role, sub
 		}
 	}
 
@@ -245,25 +304,25 @@ func (s *Server) isAuthorized(r *http.Request) (bool, string) {
 		cfEmail := strings.ToLower(strings.TrimSpace(r.Header.Get("Cf-Access-Authenticated-User-Email")))
 		if cfEmail != "" {
 			if len(s.cfEmails) == 0 {
-				return true, cfEmail
+				return authAdmin, cfEmail
 			}
 			for _, allowed := range s.cfEmails {
 				if cfEmail == allowed {
-					return true, cfEmail
+					return authAdmin, cfEmail
 				}
 			}
 		} else if len(s.cfEmails) == 0 && strings.TrimSpace(r.Header.Get("Cf-Access-Jwt-Assertion")) != "" {
-			return true, "cf-access-user"
+			return authAdmin, "cf-access-user"
 		}
 	}
 
-	return false, ""
+	return authNone, ""
 }
 
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ok, _ := s.isAuthorized(r)
-		if !ok {
+		role, _ := s.authenticateRequest(r)
+		if role == authNone {
 			http.Error(w, `{"ok":false,"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
@@ -271,11 +330,25 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (s *Server) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		role, _ := s.authenticateRequest(r)
+		switch role {
+		case authAdmin:
+			next(w, r)
+		case authNode:
+			http.Error(w, `{"ok":false,"error":"admin authentication required"}`, http.StatusForbidden)
+		default:
+			http.Error(w, `{"ok":false,"error":"unauthorized"}`, http.StatusUnauthorized)
+		}
+	}
+}
+
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
-	ok, cfEmail := s.isAuthorized(r)
+	role, cfEmail := s.authenticateRequest(r)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            true,
-		"authenticated": ok,
+		"authenticated": role == authAdmin,
 		"cf_email":      cfEmail,
 	})
 }
@@ -398,6 +471,9 @@ func (s *Server) loadPersistedNodes() {
 	for i := range list {
 		n := list[i]
 		n.Online = false
+		n.KeyringLocked = nil
+		n.KeyringUnlockPending = false
+		n.KeyringUnlockError = ""
 		if n.PowerState != protocol.PowerSleeping {
 			n.PowerState = protocol.PowerOffline
 		}
@@ -412,7 +488,10 @@ func (s *Server) persistNodesLocked() {
 	}
 	list := make([]protocol.NodeInfo, 0, len(s.nodes))
 	for _, n := range s.nodes {
-		list = append(list, *n)
+		cp := *n
+		cp.KeyringUnlockPending = false
+		cp.KeyringUnlockError = ""
+		list = append(list, cp)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].NodeID < list[j].NodeID })
 	b, err := json.MarshalIndent(list, "", "  ")
@@ -428,6 +507,10 @@ func (s *Server) ListNodes() []protocol.NodeInfo {
 	out := make([]protocol.NodeInfo, 0, len(s.nodes))
 	for _, n := range s.nodes {
 		cp := *n
+		if st, ok := s.keyringStatus[n.NodeID]; ok {
+			cp.KeyringUnlockPending = st.pending
+			cp.KeyringUnlockError = st.err
+		}
 		out = append(out, cp)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -605,18 +688,100 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
-	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/nodes/")
-	parts := strings.Split(strings.Trim(trimmed, "/"), "/")
+	trimmed := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/nodes/"), "/")
+	if trimmed == "" {
+		http.NotFound(w, r)
+		return
+	}
+	parts := strings.Split(trimmed, "/")
+	nodeID := parts[0]
+	role, _ := s.authenticateRequest(r)
+
+	if len(parts) == 1 {
+		switch r.Method {
+		case http.MethodPatch:
+			if role != authAdmin {
+				writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "admin authentication required"})
+				return
+			}
+			var body struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request body"})
+				return
+			}
+			clean := strings.TrimSpace(body.Name)
+			if clean == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "machine name cannot be empty"})
+				return
+			}
+			if runes := []rune(clean); len(runes) > 80 {
+				clean = string(runes[:80])
+			}
+			s.mu.Lock()
+			n, exists := s.nodes[nodeID]
+			if !exists {
+				s.mu.Unlock()
+				writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "node not found"})
+				return
+			}
+			n.Name = clean
+			n.CustomName = true
+			s.persistNodesLocked()
+			cp := *n
+			s.mu.Unlock()
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "node": cp})
+			return
+		case http.MethodDelete:
+			if role != authAdmin {
+				writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "admin authentication required"})
+				return
+			}
+			s.mu.Lock()
+			if _, exists := s.nodes[nodeID]; !exists {
+				s.mu.Unlock()
+				writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "node not found"})
+				return
+			}
+			active := s.agents[nodeID]
+			delete(s.agents, nodeID)
+			delete(s.nodes, nodeID)
+			if p := s.pendingKeyringUnlocks[nodeID]; p != nil {
+				if p.timer != nil {
+					p.timer.Stop()
+				}
+				p.password = ""
+				delete(s.pendingKeyringUnlocks, nodeID)
+			}
+			delete(s.keyringStatus, nodeID)
+			s.persistNodesLocked()
+			s.mu.Unlock()
+
+			s.nodeCreds.Revoke(nodeID)
+			if active != nil {
+				active.close()
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "node_id": nodeID})
+			return
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	}
+
 	if len(parts) != 2 {
 		http.NotFound(w, r)
 		return
 	}
 
-	nodeID := parts[0]
-
 	if parts[1] == "wol" {
 		if r.Method != http.MethodPatch {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if role != authAdmin {
+			writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "admin authentication required"})
 			return
 		}
 		var body struct {
@@ -671,6 +836,44 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if parts[1] == "unlock-keyring" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if role != authAdmin {
+			writeJSON(w, http.StatusForbidden, protocol.UnlockKeyringResponse{OK: false, NodeID: nodeID, Error: "admin authentication required"})
+			return
+		}
+		var req protocol.UnlockKeyringRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, protocol.UnlockKeyringResponse{OK: false, NodeID: nodeID, Error: "invalid request body"})
+			return
+		}
+		if req.Password == "" {
+			writeJSON(w, http.StatusBadRequest, protocol.UnlockKeyringResponse{OK: false, NodeID: nodeID, Error: "please enter the keyring password"})
+			return
+		}
+
+		s.mu.RLock()
+		_, exists := s.nodes[nodeID]
+		agent := s.agents[nodeID]
+		s.mu.RUnlock()
+
+		if !exists {
+			writeJSON(w, http.StatusNotFound, protocol.UnlockKeyringResponse{OK: false, NodeID: nodeID, Error: "node not found"})
+			return
+		}
+		if agent == nil {
+			writeJSON(w, http.StatusServiceUnavailable, protocol.UnlockKeyringResponse{OK: false, NodeID: nodeID, Error: "target node is offline"})
+			return
+		}
+
+		res, status := s.unlockWithAgent(nodeID, agent, req.Password, 8*time.Second)
+		writeJSON(w, status, res)
+		return
+	}
+
 	if parts[1] != "power" {
 		http.NotFound(w, r)
 		return
@@ -685,6 +888,10 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: "invalid request body"})
 		return
 	}
+	if req.KeyringPassword != "" && role != authAdmin {
+		writeJSON(w, http.StatusForbidden, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: "admin authentication required"})
+		return
+	}
 
 	s.mu.RLock()
 	node, exists := s.nodes[nodeID]
@@ -695,40 +902,53 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 	agent := s.agents[nodeID]
 	s.mu.RUnlock()
 
-	if exists && nodeCopy.IsVPS && (req.Action == protocol.ActionSoftSleep || req.Action == protocol.ActionHardSleep) {
+	if exists && nodeCopy.IsVPS && (req.Action == protocol.ActionSoftSleep || req.Action == protocol.ActionHardSleep || req.Action == protocol.ActionPowerOff) {
 		writeJSON(w, http.StatusBadRequest, protocol.PowerResponse{
 			OK:     false,
 			NodeID: nodeID,
-			Error:  "refusing to sleep a VPS / virtual machine (would make it unreachable without provider console reboot)",
+			Error:  "refusing to sleep or power off a VPS / virtual machine (would make it unreachable without provider console reboot)",
 		})
 		return
 	}
 
 	if req.Action == protocol.ActionWake {
+		if agent != nil && nodeCopy.PowerState == protocol.PowerSleeping {
+			s.evictAgent(nodeID, agent, true)
+			agent = nil
+		}
+
+		var softWakeErr error
 		if agent != nil {
 			ack, err := s.sendAndWait(agent, protocol.ControlFrame{
 				Type:   "power-cmd",
 				Action: string(protocol.ActionWake),
-			}, 6*time.Second)
-			if err != nil {
-				writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: err.Error()})
+			}, s.softWakeTimeout)
+			if err == nil {
+				if !ack.OK {
+					writeJSON(w, http.StatusServiceUnavailable, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: ack.Error})
+					return
+				}
+				s.updateNodePowerState(nodeID, ack.PowerState)
+				resp := protocol.PowerResponse{
+					OK:         true,
+					NodeID:     nodeID,
+					Method:     "direct-soft-wake",
+					PowerState: ack.PowerState,
+				}
+				if req.KeyringPassword != "" {
+					uRes, _ := s.unlockWithAgent(nodeID, agent, req.KeyringPassword, 8*time.Second)
+					resp.KeyringUnlocked = uRes.OK
+					resp.KeyringError = uRes.Error
+				}
+				writeJSON(w, http.StatusOK, resp)
 				return
 			}
-			if !ack.OK {
-				writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: ack.Error})
-				return
-			}
-			s.updateNodePowerState(nodeID, ack.PowerState)
-			writeJSON(w, http.StatusOK, protocol.PowerResponse{
-				OK:         true,
-				NodeID:     nodeID,
-				Method:     "direct-soft-wake",
-				PowerState: ack.PowerState,
-			})
-			return
+			softWakeErr = err
+			s.evictAgent(nodeID, agent, false)
+			agent = nil
 		}
 
-		// Target is offline or sleeping: require manual Wake-on-LAN binding (MAC + WakeRelayID), matching agy-web-studio.
+		// Target is offline, sleeping, or had a dead zombie socket: route via bound ESP32 Wake-on-LAN relay.
 		mac := strings.TrimSpace(req.MAC)
 		bcast := strings.TrimSpace(req.BroadcastIP)
 		relayID := strings.TrimSpace(req.RelayNodeID)
@@ -750,10 +970,16 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if mac == "" || relayID == "" {
-			writeJSON(w, http.StatusBadRequest, protocol.PowerResponse{
+			status := http.StatusBadRequest
+			msg := "Wake-on-LAN is not bound for this machine (bind MAC + Wake Relay manually first)"
+			if softWakeErr != nil {
+				status = http.StatusServiceUnavailable
+				msg = fmt.Sprintf("soft-wake failed (%v) and Wake-on-LAN is not bound", softWakeErr)
+			}
+			writeJSON(w, status, protocol.PowerResponse{
 				OK:     false,
 				NodeID: nodeID,
-				Error:  "Wake-on-LAN is not bound for this machine (bind MAC + Wake Relay manually first)",
+				Error:  msg,
 			})
 			return
 		}
@@ -771,8 +997,15 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if req.KeyringPassword != "" {
+			s.queueWakeKeyringUnlock(nodeID, req.KeyringPassword)
+		}
+
 		if err := s.sendESP32Wake(espRelay, mac, bcast, port, 5*time.Second); err != nil {
-			writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{
+			if req.KeyringPassword != "" {
+				s.clearWakeKeyringUnlock(nodeID)
+			}
+			writeJSON(w, http.StatusServiceUnavailable, protocol.PowerResponse{
 				OK:     false,
 				NodeID: nodeID,
 				Error:  err.Error(),
@@ -780,10 +1013,11 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, protocol.PowerResponse{
-			OK:     true,
-			NodeID: nodeID,
-			Method: "wol-esp32-relay",
-			Relays: []string{relayID},
+			OK:           true,
+			NodeID:       nodeID,
+			Method:       "wol-esp32-relay",
+			Relays:       []string{relayID},
+			UnlockQueued: req.KeyringPassword != "",
 		})
 		return
 	}
@@ -802,14 +1036,21 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		Action: string(req.Action),
 	}, 6*time.Second)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: err.Error()})
+		if req.Action == protocol.ActionHardSleep || req.Action == protocol.ActionPowerOff {
+			s.evictAgent(nodeID, agent, false)
+		}
+		writeJSON(w, http.StatusServiceUnavailable, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: err.Error()})
 		return
 	}
 	if !ack.OK {
-		writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: ack.Error})
+		writeJSON(w, http.StatusServiceUnavailable, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: ack.Error})
 		return
 	}
-	if ack.PowerState != "" {
+	if req.Action == protocol.ActionHardSleep {
+		s.evictAgent(nodeID, agent, true)
+	} else if req.Action == protocol.ActionPowerOff {
+		s.evictAgent(nodeID, agent, false)
+	} else if ack.PowerState != "" {
 		s.updateNodePowerState(nodeID, ack.PowerState)
 	}
 	writeJSON(w, http.StatusOK, protocol.PowerResponse{
@@ -880,6 +1121,163 @@ func (s *Server) updateNodePowerState(nodeID string, state protocol.PowerState) 
 	}
 }
 
+func (s *Server) evictAgent(nodeID string, agent *activeAgent, sleeping bool) {
+	if agent == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.agents[nodeID] == agent {
+		delete(s.agents, nodeID)
+		if n, exists := s.nodes[nodeID]; exists {
+			n.Online = false
+			n.KeyringLocked = nil
+			n.LastSeen = time.Now().UTC()
+			if sleeping {
+				n.PowerState = protocol.PowerSleeping
+			} else if n.PowerState != protocol.PowerSleeping {
+				n.PowerState = protocol.PowerOffline
+			}
+			s.persistNodesLocked()
+		}
+	}
+	s.mu.Unlock()
+	agent.close()
+}
+
+func (s *Server) queueWakeKeyringUnlock(nodeID, password string) {
+	if password == "" {
+		return
+	}
+	ttl := s.keyringUnlockTTL
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	entry := &pendingKeyringUnlock{
+		password:  password,
+		expiresAt: time.Now().Add(ttl),
+	}
+
+	s.mu.Lock()
+	if prev := s.pendingKeyringUnlocks[nodeID]; prev != nil {
+		if prev.timer != nil {
+			prev.timer.Stop()
+		}
+		prev.password = ""
+	}
+	entry.timer = time.AfterFunc(ttl, func() {
+		s.expirePendingKeyringUnlock(nodeID, entry)
+	})
+	s.pendingKeyringUnlocks[nodeID] = entry
+	s.keyringStatus[nodeID] = keyringUnlockStatus{pending: true}
+	s.mu.Unlock()
+}
+
+func (s *Server) expirePendingKeyringUnlock(nodeID string, expected *pendingKeyringUnlock) {
+	s.mu.Lock()
+	if cur := s.pendingKeyringUnlocks[nodeID]; cur == expected {
+		cur.password = ""
+		delete(s.pendingKeyringUnlocks, nodeID)
+		delete(s.keyringStatus, nodeID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) clearWakeKeyringUnlock(nodeID string) {
+	s.mu.Lock()
+	if cur := s.pendingKeyringUnlocks[nodeID]; cur != nil {
+		if cur.timer != nil {
+			cur.timer.Stop()
+		}
+		cur.password = ""
+		delete(s.pendingKeyringUnlocks, nodeID)
+	}
+	delete(s.keyringStatus, nodeID)
+	s.mu.Unlock()
+}
+
+func (s *Server) consumePendingKeyringUnlock(nodeID string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur := s.pendingKeyringUnlocks[nodeID]
+	if cur == nil {
+		return "", false
+	}
+	if cur.timer != nil {
+		cur.timer.Stop()
+	}
+	pw := cur.password
+	exp := cur.expiresAt
+	cur.password = ""
+	delete(s.pendingKeyringUnlocks, nodeID)
+	if pw == "" || !time.Now().Before(exp) {
+		delete(s.keyringStatus, nodeID)
+		return "", false
+	}
+	return pw, true
+}
+
+func (s *Server) runAutoKeyringUnlock(nodeID string, agent *activeAgent, password string) {
+	_, _ = s.unlockWithAgent(nodeID, agent, password, 10*time.Second)
+}
+
+func (s *Server) unlockWithAgent(nodeID string, agent *activeAgent, password string, timeout time.Duration) (protocol.UnlockKeyringResponse, int) {
+	s.mu.Lock()
+	s.keyringStatus[nodeID] = keyringUnlockStatus{pending: true}
+	s.mu.Unlock()
+
+	ack, err := s.sendAndWait(agent, protocol.ControlFrame{
+		Type:     "unlock-keyring",
+		Password: password,
+	}, timeout)
+	if err != nil {
+		s.mu.Lock()
+		s.keyringStatus[nodeID] = keyringUnlockStatus{pending: false, err: err.Error()}
+		s.mu.Unlock()
+		return protocol.UnlockKeyringResponse{
+			OK:     false,
+			NodeID: nodeID,
+			Error:  err.Error(),
+		}, http.StatusServiceUnavailable
+	}
+
+	if !ack.OK {
+		errMsg := ack.Error
+		if errMsg == "" {
+			errMsg = "failed to unlock keyring"
+		}
+		s.mu.Lock()
+		if n, ok := s.nodes[nodeID]; ok && ack.KeyringLocked != nil {
+			kl := *ack.KeyringLocked
+			n.KeyringLocked = &kl
+		}
+		s.keyringStatus[nodeID] = keyringUnlockStatus{pending: false, err: errMsg}
+		s.mu.Unlock()
+		return protocol.UnlockKeyringResponse{
+			OK:            false,
+			NodeID:        nodeID,
+			KeyringLocked: ack.KeyringLocked,
+			Error:         errMsg,
+		}, http.StatusUnauthorized
+	}
+
+	locked := false
+	if ack.KeyringLocked != nil {
+		locked = *ack.KeyringLocked
+	}
+	s.mu.Lock()
+	if n, ok := s.nodes[nodeID]; ok {
+		kl := locked
+		n.KeyringLocked = &kl
+	}
+	delete(s.keyringStatus, nodeID)
+	s.mu.Unlock()
+	return protocol.UnlockKeyringResponse{
+		OK:            true,
+		NodeID:        nodeID,
+		KeyringLocked: &locked,
+	}, http.StatusOK
+}
+
 func (s *Server) sendAndWait(agent *activeAgent, frame protocol.ControlFrame, timeout time.Duration) (protocol.ControlFrame, error) {
 	reqID := newRandomID(8)
 	frame.ReqID = reqID
@@ -903,8 +1301,18 @@ func (s *Server) sendAndWait(agent *activeAgent, frame protocol.ControlFrame, ti
 	case resp := <-ch:
 		return resp, nil
 	case <-time.After(timeout):
+		select {
+		case resp := <-ch:
+			return resp, nil
+		default:
+		}
 		return protocol.ControlFrame{}, errors.New("agent timed out acknowledging command")
 	case <-agent.closed:
+		select {
+		case resp := <-ch:
+			return resp, nil
+		default:
+		}
 		return protocol.ControlFrame{}, errors.New("agent disconnected before acknowledging command")
 	}
 }
@@ -931,12 +1339,22 @@ func upgradeTunnelConn(w http.ResponseWriter, r *http.Request, customProto strin
 }
 
 func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
+	role, boundNodeID := s.authenticateRequest(r)
 	hConn, err := upgradeTunnelConn(w, r, "ssh-fleet-control")
 	if err != nil {
 		return
 	}
 	scanner := bufio.NewScanner(hConn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	handshakeTimeout := s.agentReadTimeout
+	if handshakeTimeout <= 0 || handshakeTimeout > 15*time.Second {
+		handshakeTimeout = 15 * time.Second
+	}
+	if handshakeTimeout < 2*time.Second {
+		handshakeTimeout = 2 * time.Second
+	}
+	_ = hConn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 
 	if !scanner.Scan() {
 		_ = hConn.Close()
@@ -949,9 +1367,18 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	regNodeID := strings.TrimSpace(reg.Node.NodeID)
+	if role == authNode && regNodeID != boundNodeID {
+		_ = hConn.Close()
+		return
+	}
+
 	now := time.Now().UTC()
 	node := *reg.Node
+	node.NodeID = regNodeID
 	node.Online = true
+	node.KeyringUnlockPending = false
+	node.KeyringUnlockError = ""
 	if node.PowerState == "" || node.PowerState == protocol.PowerOffline || node.PowerState == protocol.PowerSleeping {
 		node.PowerState = protocol.PowerActive
 	}
@@ -968,8 +1395,14 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 	if old := s.agents[node.NodeID]; old != nil {
 		old.close()
 	}
-	if prevNode := s.nodes[node.NodeID]; prevNode != nil && prevNode.WoL != nil {
-		node.WoL = prevNode.WoL
+	if prevNode := s.nodes[node.NodeID]; prevNode != nil {
+		if prevNode.WoL != nil {
+			node.WoL = prevNode.WoL
+		}
+		if prevNode.CustomName && strings.TrimSpace(prevNode.Name) != "" {
+			node.Name = prevNode.Name
+			node.CustomName = true
+		}
 	}
 	s.agents[node.NodeID] = agent
 	s.nodes[node.NodeID] = &node
@@ -978,6 +1411,16 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 
 	_ = agent.send(protocol.ControlFrame{Type: "register-ack", OK: true})
 
+	if pw, ok := s.consumePendingKeyringUnlock(node.NodeID); ok {
+		if node.KeyringLocked != nil && !*node.KeyringLocked {
+			s.mu.Lock()
+			delete(s.keyringStatus, node.NodeID)
+			s.mu.Unlock()
+		} else {
+			go s.runAutoKeyringUnlock(node.NodeID, agent, pw)
+		}
+	}
+
 	defer func() {
 		agent.close()
 		s.mu.Lock()
@@ -985,6 +1428,7 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 			delete(s.agents, node.NodeID)
 			if n, exists := s.nodes[node.NodeID]; exists {
 				n.Online = false
+				n.KeyringLocked = nil
 				n.LastSeen = time.Now().UTC()
 				if n.PowerState != protocol.PowerSleeping {
 					n.PowerState = protocol.PowerOffline
@@ -995,7 +1439,11 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}()
 
-	for scanner.Scan() {
+	for {
+		_ = hConn.SetReadDeadline(time.Now().Add(s.agentReadTimeout))
+		if !scanner.Scan() {
+			break
+		}
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
@@ -1013,6 +1461,15 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 				if frame.PowerState != "" {
 					n.PowerState = frame.PowerState
 				}
+				if frame.KeyringLocked != nil {
+					kl := *frame.KeyringLocked
+					n.KeyringLocked = &kl
+					if !kl {
+						if st, ok := s.keyringStatus[node.NodeID]; ok && !st.pending {
+							delete(s.keyringStatus, node.NodeID)
+						}
+					}
+				}
 			}
 			s.mu.Unlock()
 			_ = agent.send(protocol.ControlFrame{Type: "pong"})
@@ -1021,10 +1478,20 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 			if n, exists := s.nodes[node.NodeID]; exists {
 				if frame.Node != nil {
 					upd := *frame.Node
+					upd.NodeID = node.NodeID
 					upd.Online = true
 					upd.ConnectedAt = n.ConnectedAt
 					upd.LastSeen = time.Now().UTC()
 					upd.WoL = n.WoL
+					if n.CustomName && strings.TrimSpace(n.Name) != "" {
+						upd.Name = n.Name
+						upd.CustomName = true
+					}
+					upd.KeyringUnlockPending = false
+					upd.KeyringUnlockError = ""
+					if upd.KeyringLocked == nil {
+						upd.KeyringLocked = n.KeyringLocked
+					}
 					s.nodes[node.NodeID] = &upd
 				} else if frame.PowerState != "" {
 					n.PowerState = frame.PowerState
@@ -1033,7 +1500,15 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 				s.persistNodesLocked()
 			}
 			s.mu.Unlock()
-		case "power-ack", "wol-ack":
+		case "power-ack", "wol-ack", "unlock-keyring-ack":
+			if frame.Type == "unlock-keyring-ack" && frame.KeyringLocked != nil {
+				s.mu.Lock()
+				if n, exists := s.nodes[node.NodeID]; exists {
+					kl := *frame.KeyringLocked
+					n.KeyringLocked = &kl
+				}
+				s.mu.Unlock()
+			}
 			if frame.ReqID != "" {
 				s.mu.RLock()
 				p := s.pendingReq[frame.ReqID]
@@ -1375,7 +1850,7 @@ func (s *Server) handleESP32WakeTunnel(w http.ResponseWriter, r *http.Request) {
 	if rec, ok := s.wakeReg.VerifyBearer(r.Header.Get("Authorization")); ok {
 		relayID = rec.ID
 		registered = true
-	} else if ok, _ := s.isAuthorized(r); ok {
+	} else if role, _ := s.authenticateRequest(r); role == authAdmin {
 		relayID = "esp32-" + newRandomID(4)
 	} else {
 		http.Error(w, `{"ok":false,"error":"invalid wake relay credential"}`, http.StatusUnauthorized)
@@ -1420,6 +1895,7 @@ func (s *Server) handleESP32WakeTunnel(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(s.esp32ReadTimeout))
 		_, payload, rErr := conn.ReadMessage()
 		if rErr != nil {
 			return

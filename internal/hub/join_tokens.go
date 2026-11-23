@@ -191,3 +191,18 @@ func (s *NodeCredStore) Verify(rawToken string) (string, bool) {
 	}
 	return nodeID, true
 }
+
+func (s *NodeCredStore) Revoke(nodeID string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.records[nodeID]; !exists {
+		return false
+	}
+	delete(s.records, nodeID)
+	s.saveLocked()
+	return true
+}

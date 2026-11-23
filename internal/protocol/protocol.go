@@ -19,6 +19,7 @@ const (
 	ActionKeepAwakeOff PowerAction = "keep-awake-off"
 	ActionSoftSleep    PowerAction = "soft-sleep"
 	ActionHardSleep    PowerAction = "hard-sleep"
+	ActionPowerOff     PowerAction = "poweroff"
 	ActionWake         PowerAction = "wake"
 )
 
@@ -41,6 +42,7 @@ type WakeRelaySummary struct {
 type NodeInfo struct {
 	NodeID      string         `json:"node_id"`
 	Name        string         `json:"name"`
+	CustomName  bool           `json:"custom_name,omitempty"`
 	Hostname    string         `json:"hostname"`
 	OS          string         `json:"os"`
 	Arch        string         `json:"arch"`
@@ -50,41 +52,61 @@ type NodeInfo struct {
 	SubnetCIDRs []string       `json:"subnet_cidrs,omitempty"`
 	MACAddrs    []string       `json:"mac_addrs,omitempty"`
 	BroadcastIP string         `json:"broadcast_ip,omitempty"`
-	PowerState  PowerState     `json:"power_state"`
-	Online      bool           `json:"online"`
-	IsVPS       bool           `json:"is_vps,omitempty"`
-	WoL         *NodeWolConfig `json:"wol,omitempty"`
-	ConnectedAt time.Time      `json:"connected_at,omitempty"`
-	LastSeen    time.Time      `json:"last_seen"`
+	PowerState           PowerState     `json:"power_state"`
+	Online               bool           `json:"online"`
+	IsVPS                bool           `json:"is_vps,omitempty"`
+	WoL                  *NodeWolConfig `json:"wol,omitempty"`
+	KeyringLocked        *bool          `json:"keyring_locked,omitempty"`
+	KeyringUnlockPending bool           `json:"keyring_unlock_pending,omitempty"`
+	KeyringUnlockError   string         `json:"keyring_unlock_error,omitempty"`
+	ConnectedAt          time.Time      `json:"connected_at,omitempty"`
+	LastSeen             time.Time      `json:"last_seen"`
 }
 
 // ControlFrame represents a single newline-delimited JSON message over the Hub <-> Agent control channel.
 type ControlFrame struct {
-	Type        string     `json:"t"`
-	ReqID       string     `json:"req_id,omitempty"`
-	StreamID    string     `json:"stream_id,omitempty"`
-	Node        *NodeInfo  `json:"node,omitempty"`
-	PowerState  PowerState `json:"power_state,omitempty"`
-	Action      string     `json:"action,omitempty"`
-	MAC         string     `json:"mac,omitempty"`
-	BroadcastIP string     `json:"broadcast_ip,omitempty"`
-	TargetPort  int        `json:"target_port,omitempty"`
-	OK          bool       `json:"ok,omitempty"`
-	Error       string     `json:"error,omitempty"`
+	Type          string     `json:"t"`
+	ReqID         string     `json:"req_id,omitempty"`
+	StreamID      string     `json:"stream_id,omitempty"`
+	Node          *NodeInfo  `json:"node,omitempty"`
+	PowerState    PowerState `json:"power_state,omitempty"`
+	Action        string     `json:"action,omitempty"`
+	MAC           string     `json:"mac,omitempty"`
+	BroadcastIP   string     `json:"broadcast_ip,omitempty"`
+	TargetPort    int        `json:"target_port,omitempty"`
+	Password      string     `json:"password,omitempty"`
+	KeyringLocked *bool      `json:"keyring_locked,omitempty"`
+	OK            bool       `json:"ok,omitempty"`
+	Error         string     `json:"error,omitempty"`
 }
 
 type PowerRequest struct {
-	Action      PowerAction `json:"action"`
-	MAC         string      `json:"mac,omitempty"`
-	BroadcastIP string      `json:"broadcast_ip,omitempty"`
-	RelayNodeID string      `json:"relay_node_id,omitempty"`
+	Action          PowerAction `json:"action"`
+	MAC             string      `json:"mac,omitempty"`
+	BroadcastIP     string      `json:"broadcast_ip,omitempty"`
+	RelayNodeID     string      `json:"relay_node_id,omitempty"`
+	KeyringPassword string      `json:"keyring_password,omitempty"`
 }
 
 type PowerResponse struct {
-	OK         bool       `json:"ok"`
-	NodeID     string     `json:"node_id"`
-	Method     string     `json:"method"`
-	PowerState PowerState `json:"power_state,omitempty"`
-	Relays     []string   `json:"relays,omitempty"`
-	Error      string     `json:"error,omitempty"`
+	OK              bool       `json:"ok"`
+	NodeID          string     `json:"node_id"`
+	Method          string     `json:"method"`
+	PowerState      PowerState `json:"power_state,omitempty"`
+	Relays          []string   `json:"relays,omitempty"`
+	UnlockQueued    bool       `json:"unlock_queued,omitempty"`
+	KeyringUnlocked bool       `json:"keyring_unlocked,omitempty"`
+	KeyringError    string     `json:"keyring_error,omitempty"`
+	Error           string     `json:"error,omitempty"`
+}
+
+type UnlockKeyringRequest struct {
+	Password string `json:"password"`
+}
+
+type UnlockKeyringResponse struct {
+	OK            bool   `json:"ok"`
+	NodeID        string `json:"node_id"`
+	KeyringLocked *bool  `json:"keyring_locked,omitempty"`
+	Error         string `json:"error,omitempty"`
 }

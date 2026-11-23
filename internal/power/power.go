@@ -1,7 +1,9 @@
 package power
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -18,6 +20,7 @@ type Executor interface {
 	SoftSleep() error
 	WakeDisplay() error
 	HardSleep() error
+	PowerOff() error
 }
 
 type Manager struct {
@@ -117,7 +120,7 @@ func (m *Manager) Wake() (protocol.PowerState, error) {
 }
 
 // PrepareHardSleep stops inhibitors and schedules OS suspend after a short delay so the ACK frame flushes first.
-func (m *Manager) PrepareHardSleep(delay time.Duration) error {
+func (m *Manager) PrepareHardSleep(delay time.Duration, beforeSuspend ...func()) error {
 	m.mu.Lock()
 	m.stopInhibitorLocked()
 	m.keepAwake = false
@@ -128,7 +131,45 @@ func (m *Manager) PrepareHardSleep(delay time.Duration) error {
 		delay = 250 * time.Millisecond
 	}
 	time.AfterFunc(delay, func() {
+		for _, fn := range beforeSuspend {
+			if fn != nil {
+				fn()
+			}
+		}
 		_ = m.exec.HardSleep()
+	})
+	return nil
+}
+
+// CheckPowerOff verifies whether the host has permission/support to power off before ACKing.
+func (m *Manager) CheckPowerOff() error {
+	if checker, ok := m.exec.(interface{ CheckPowerOff() error }); ok {
+		return checker.CheckPowerOff()
+	}
+	return nil
+}
+
+// PreparePowerOff checks permissions, stops inhibitors, and schedules OS shutdown after delay so the ACK frame flushes first.
+func (m *Manager) PreparePowerOff(delay time.Duration, beforePowerOff ...func()) error {
+	if err := m.CheckPowerOff(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.stopInhibitorLocked()
+	m.keepAwake = false
+	m.softSleep = false
+	m.mu.Unlock()
+
+	if delay <= 0 {
+		delay = 250 * time.Millisecond
+	}
+	time.AfterFunc(delay, func() {
+		for _, fn := range beforePowerOff {
+			if fn != nil {
+				fn()
+			}
+		}
+		_ = m.exec.PowerOff()
 	})
 	return nil
 }
@@ -254,4 +295,47 @@ func (osExecutor) HardSleep() error {
 	default:
 		return fmt.Errorf("hard sleep not supported on %s", strings.TrimSpace(runtime.GOOS))
 	}
+}
+
+func resolvePowerOffCmd() (*exec.Cmd, error) {
+	switch runtime.GOOS {
+	case "linux":
+		if os.Geteuid() == 0 {
+			return exec.Command("systemctl", "poweroff", "-i"), nil
+		}
+		pid := strconv.Itoa(execPID())
+		if _, err := exec.LookPath("pkcheck"); err == nil {
+			if err := exec.Command("pkcheck", "--action-id", "org.freedesktop.login1.power-off", "--process", pid).Run(); err == nil {
+				if err := exec.Command("pkcheck", "--action-id", "org.freedesktop.login1.inhibit-block-shutdown", "--process", pid).Run(); err == nil {
+					return exec.Command("systemctl", "poweroff", "-i"), nil
+				}
+				return exec.Command("systemctl", "poweroff"), nil
+			}
+		}
+		if _, err := exec.LookPath("sudo"); err == nil {
+			if exec.Command("sudo", "-n", "true").Run() == nil || exec.Command("sudo", "-n", "-l", "systemctl").Run() == nil {
+				return exec.Command("sudo", "-n", "systemctl", "poweroff", "-i"), nil
+			}
+		}
+		return nil, errors.New("shutdown permission denied (polkit or passwordless sudo required)")
+	case "darwin":
+		return exec.Command("osascript", "-e", `tell application "System Events" to shut down`), nil
+	case "windows":
+		return exec.Command("shutdown", "/s", "/t", "0"), nil
+	default:
+		return nil, fmt.Errorf("power off not supported on %s", strings.TrimSpace(runtime.GOOS))
+	}
+}
+
+func (osExecutor) CheckPowerOff() error {
+	_, err := resolvePowerOffCmd()
+	return err
+}
+
+func (osExecutor) PowerOff() error {
+	cmd, err := resolvePowerOffCmd()
+	if err != nil {
+		return err
+	}
+	return cmd.Run()
 }

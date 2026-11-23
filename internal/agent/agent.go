@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"ssh-fleet/internal/keyring"
 	"ssh-fleet/internal/power"
 	"ssh-fleet/internal/protocol"
 	"ssh-fleet/internal/wol"
@@ -35,6 +36,7 @@ type Options struct {
 	SSHUser        string
 	IsVPS          *bool
 	Power          *power.Manager
+	Keyring        keyring.Handler
 	WoLHandler     func(mac, broadcastIP string) error
 	NetworkInfoFn  func() ([]wol.NetInterfaceInfo, error)
 	PingInterval   time.Duration
@@ -42,9 +44,12 @@ type Options struct {
 }
 
 type Client struct {
-	opts  Options
-	power *power.Manager
-	isVPS bool
+	opts               Options
+	power              *power.Manager
+	keyring            keyring.Handler
+	isVPS              bool
+	suspendMu          sync.Mutex
+	reconnectHoldUntil time.Time
 }
 
 func NewClient(opts Options) (*Client, error) {
@@ -85,6 +90,9 @@ func NewClient(opts Options) (*Client, error) {
 	if opts.Power == nil {
 		opts.Power = power.NewManager(nil)
 	}
+	if opts.Keyring == nil {
+		opts.Keyring = keyring.NewOSHandler()
+	}
 	if opts.WoLHandler == nil {
 		opts.WoLHandler = func(mac, broadcastIP string) error {
 			return wol.SendMagicPacket(mac, broadcastIP, 9, 7)
@@ -103,7 +111,7 @@ func NewClient(opts Options) (*Client, error) {
 	if opts.IsVPS != nil {
 		isVPS = *opts.IsVPS
 	}
-	return &Client{opts: opts, power: opts.Power, isVPS: isVPS}, nil
+	return &Client{opts: opts, power: opts.Power, keyring: opts.Keyring, isVPS: isVPS}, nil
 }
 
 // DetectIsVPS reports whether the host is running inside a cloud VM / hypervisor / container.
@@ -139,8 +147,35 @@ func DetectIsVPS() bool {
 	return false
 }
 
+func (c *Client) setReconnectHold(d time.Duration) {
+	until := time.Now().Add(d)
+	c.suspendMu.Lock()
+	if until.After(c.reconnectHoldUntil) {
+		c.reconnectHoldUntil = until
+	}
+	c.suspendMu.Unlock()
+}
+
+func (c *Client) waitReconnectHold(ctx context.Context) error {
+	c.suspendMu.Lock()
+	until := c.reconnectHoldUntil
+	c.suspendMu.Unlock()
+	if wait := time.Until(until); wait > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return nil
+}
+
 func (c *Client) Run(ctx context.Context) error {
 	for {
+		if err := c.waitReconnectHold(ctx); err != nil {
+			c.power.Close()
+			return err
+		}
 		err := c.connectOnce(ctx)
 		if ctx.Err() != nil {
 			c.power.Close()
@@ -156,6 +191,18 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (c *Client) probeKeyringLocked(ctx context.Context) *bool {
+	if c.keyring == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return c.keyring.IsLocked(probeCtx)
 }
 
 func (c *Client) buildNodeInfo() protocol.NodeInfo {
@@ -183,20 +230,21 @@ func (c *Client) buildNodeInfo() protocol.NodeInfo {
 	}
 
 	return protocol.NodeInfo{
-		NodeID:      c.opts.NodeID,
-		Name:        c.opts.Name,
-		Hostname:    host,
-		OS:          runtime.GOOS,
-		Arch:        runtime.GOARCH,
-		SSHUser:     c.opts.SSHUser,
-		SSHPort:     c.opts.SSHPort,
-		LocalIPs:    ips,
-		SubnetCIDRs: subnets,
-		MACAddrs:    macs,
-		BroadcastIP: bcast,
-		PowerState:  c.power.State(),
-		Online:      true,
-		IsVPS:       c.isVPS,
+		NodeID:        c.opts.NodeID,
+		Name:          c.opts.Name,
+		Hostname:      host,
+		OS:            runtime.GOOS,
+		Arch:          runtime.GOARCH,
+		SSHUser:       c.opts.SSHUser,
+		SSHPort:       c.opts.SSHPort,
+		LocalIPs:      ips,
+		SubnetCIDRs:   subnets,
+		MACAddrs:      macs,
+		BroadcastIP:   bcast,
+		PowerState:    c.power.State(),
+		Online:        true,
+		IsVPS:         c.isVPS,
+		KeyringLocked: c.probeKeyringLocked(context.Background()),
 	}
 }
 
@@ -250,8 +298,9 @@ func (c *Client) connectOnce(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				if err := sendFrame(protocol.ControlFrame{
-					Type:       "ping",
-					PowerState: c.power.State(),
+					Type:          "ping",
+					PowerState:    c.power.State(),
+					KeyringLocked: c.probeKeyringLocked(ctx),
 				}); err != nil {
 					_ = conn.Close()
 					return
@@ -260,9 +309,18 @@ func (c *Client) connectOnce(ctx context.Context) error {
 		}
 	}()
 
+	readTimeout := 3 * c.opts.PingInterval
+	if readTimeout <= 0 {
+		readTimeout = 45 * time.Second
+	}
+
 	scanner := bufio.NewScanner(br)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
+		if !scanner.Scan() {
+			break
+		}
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
@@ -273,14 +331,18 @@ func (c *Client) connectOnce(ctx context.Context) error {
 		}
 
 		switch frame.Type {
+		case "pong", "register-ack":
+			// Read deadline is refreshed at the top of the loop.
 		case "open-ssh-stream":
 			go c.handleOpenStream(ctx, frame.StreamID)
 		case "open-shell-stream":
 			go c.handleOpenShellStream(ctx, frame.StreamID)
 		case "power-cmd":
-			go c.handlePowerCmd(sendFrame, frame)
+			go c.handlePowerCmd(sendFrame, func() { _ = conn.Close() }, frame)
 		case "wol-cmd":
 			go c.handleWolCmd(sendFrame, frame)
+		case "unlock-keyring":
+			go c.handleUnlockKeyring(ctx, sendFrame, frame)
 		}
 	}
 
@@ -426,7 +488,7 @@ func buildInteractiveShellCmd() *exec.Cmd {
 	}
 }
 
-func (c *Client) handlePowerCmd(sendFrame func(protocol.ControlFrame) error, frame protocol.ControlFrame) {
+func (c *Client) handlePowerCmd(sendFrame func(protocol.ControlFrame) error, closeConn func(), frame protocol.ControlFrame) {
 	switch protocol.PowerAction(frame.Action) {
 	case protocol.ActionKeepAwakeOn:
 		st, err := c.power.SetKeepAwake(true)
@@ -485,13 +547,43 @@ func (c *Client) handlePowerCmd(sendFrame func(protocol.ControlFrame) error, fra
 			})
 			return
 		}
+		c.setReconnectHold(1750 * time.Millisecond)
 		_ = sendFrame(protocol.ControlFrame{
 			Type:       "power-ack",
 			ReqID:      frame.ReqID,
 			OK:         true,
 			PowerState: protocol.PowerSleeping,
 		})
-		_ = c.power.PrepareHardSleep(250 * time.Millisecond)
+		_ = c.power.PrepareHardSleep(250*time.Millisecond, closeConn)
+	case protocol.ActionPowerOff:
+		if c.isVPS {
+			_ = sendFrame(protocol.ControlFrame{
+				Type:       "power-ack",
+				ReqID:      frame.ReqID,
+				OK:         false,
+				PowerState: c.power.State(),
+				Error:      "refusing to power off a VPS / virtual machine",
+			})
+			return
+		}
+		if err := c.power.CheckPowerOff(); err != nil {
+			_ = sendFrame(protocol.ControlFrame{
+				Type:       "power-ack",
+				ReqID:      frame.ReqID,
+				OK:         false,
+				PowerState: c.power.State(),
+				Error:      err.Error(),
+			})
+			return
+		}
+		c.setReconnectHold(15 * time.Second)
+		_ = sendFrame(protocol.ControlFrame{
+			Type:       "power-ack",
+			ReqID:      frame.ReqID,
+			OK:         true,
+			PowerState: protocol.PowerOffline,
+		})
+		_ = c.power.PreparePowerOff(250*time.Millisecond, closeConn)
 	default:
 		_ = sendFrame(protocol.ControlFrame{
 			Type:  "power-ack",
@@ -500,6 +592,26 @@ func (c *Client) handlePowerCmd(sendFrame func(protocol.ControlFrame) error, fra
 			Error: fmt.Sprintf("unknown power action: %s", frame.Action),
 		})
 	}
+}
+
+func (c *Client) handleUnlockKeyring(ctx context.Context, sendFrame func(protocol.ControlFrame) error, frame protocol.ControlFrame) {
+	unlockCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	var res keyring.Result
+	if c.keyring == nil {
+		res = keyring.Result{OK: false, KeyringLocked: true, Error: "keyring handler unavailable"}
+	} else {
+		res = c.keyring.Unlock(unlockCtx, frame.Password)
+	}
+	locked := res.KeyringLocked
+	_ = sendFrame(protocol.ControlFrame{
+		Type:          "unlock-keyring-ack",
+		ReqID:         frame.ReqID,
+		OK:            res.OK,
+		KeyringLocked: &locked,
+		Error:         res.Error,
+	})
 }
 
 func (c *Client) handleWolCmd(sendFrame func(protocol.ControlFrame) error, frame protocol.ControlFrame) {

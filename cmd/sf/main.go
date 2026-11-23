@@ -54,8 +54,12 @@ func run(args []string) error {
 		return cmdSSH(args[1:])
 	case "wake":
 		return cmdWake(args[1:])
+	case "unlock-keyring":
+		return cmdUnlockKeyring(args[1:])
 	case "sleep":
 		return cmdSleep(args[1:])
+	case "poweroff", "shutdown":
+		return cmdPowerOff(args[1:])
 	case "keep-awake":
 		return cmdKeepAwake(args[1:])
 	case "host":
@@ -93,8 +97,10 @@ USAGE:
   sf [find [query]]                 Interactive fuzzy search across VPS & Hub devices
   sf list                           List all VPS and live/offline Hub devices
   sf ssh <target> [--wake]          Connect via native SSH (or Hub Proxy tunnel)
-  sf wake <target> [--mac ...]      Wake device (Soft-Wake or LAN Relay Wake-on-LAN)
+  sf wake <target> [--unlock-keyring] Wake device (Soft-Wake or LAN Relay WoL)
+  sf unlock-keyring <target>        Unlock Linux GNOME login keyring on online node
   sf sleep <target> [--hard|--soft] Soft-Sleep (keep Wi-Fi/SSH alive) or Hard-Sleep (S3)
+  sf poweroff <target>              Shut down remote OS completely (requires S5 WoL to wake)
   sf keep-awake <target> <on|off>   Toggle AGY-Studio-style keep-awake inhibitor
 
 VAULT & INVENTORY (E2EE):
@@ -188,6 +194,38 @@ func cfHeaderMap(cfg vault.LocalConfig) map[string]string {
 	return h
 }
 
+func getKeyringPassword() (string, error) {
+	if env := os.Getenv("SF_KEYRING_PASSWORD"); env != "" {
+		return env, nil
+	}
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Fprint(os.Stderr, "GNOME Keyring Password: ")
+	p, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	p = strings.TrimRight(p, "\r\n")
+	if p == "" {
+		return "", errors.New("keyring password cannot be empty")
+	}
+	return p, nil
+}
+
+func decodeAPIResponse(resp *http.Response, out any) error {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return fmt.Errorf("hub returned empty body (HTTP %s)", resp.Status)
+	}
+	if err := json.Unmarshal(trimmed, out); err != nil {
+		return fmt.Errorf("hub returned HTTP %s (non-JSON response)", resp.Status)
+	}
+	return nil
+}
+
 func fetchHubNodes(cfg vault.LocalConfig) ([]protocol.NodeInfo, error) {
 	if strings.TrimSpace(cfg.HubURL) == "" || strings.TrimSpace(cfg.HubToken) == "" {
 		return nil, nil
@@ -204,15 +242,23 @@ func fetchHubNodes(cfg vault.LocalConfig) ([]protocol.NodeInfo, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("hub returned %s", resp.Status)
-	}
+
 	var payload struct {
 		OK    bool                `json:"ok"`
 		Nodes []protocol.NodeInfo `json:"nodes"`
+		Error string              `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := decodeAPIResponse(resp, &payload); err != nil {
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("hub returned %s", resp.Status)
+		}
 		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		if payload.Error != "" {
+			return nil, fmt.Errorf("hub returned %s: %s", resp.Status, payload.Error)
+		}
+		return nil, fmt.Errorf("hub returned %s", resp.Status)
 	}
 	return payload.Nodes, nil
 }
@@ -357,6 +403,8 @@ func cmdFind(args []string) error {
 		return executePower(cfg, choice.Target, protocol.PowerRequest{Action: protocol.ActionSoftSleep})
 	case "hard-sleep":
 		return executePower(cfg, choice.Target, protocol.PowerRequest{Action: protocol.ActionHardSleep})
+	case "poweroff":
+		return executePower(cfg, choice.Target, protocol.PowerRequest{Action: protocol.ActionPowerOff})
 	case "keep-awake-on":
 		return executePower(cfg, choice.Target, protocol.PowerRequest{Action: protocol.ActionKeepAwakeOn})
 	case "keep-awake-off":
@@ -477,11 +525,21 @@ func cmdWake(args []string) error {
 	mac := fs.String("mac", "", "Override MAC address for Wake-on-LAN")
 	bcast := fs.String("broadcast", "", "Override broadcast IP (default 255.255.255.255)")
 	relay := fs.String("relay", "", "Preferred online LAN relay node ID")
+	unlockKeyring := fs.Bool("unlock-keyring", false, "Prompt (or read SF_KEYRING_PASSWORD) to auto-unlock Linux GNOME login keyring")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() == 0 && *mac == "" {
-		return errors.New("usage: sf wake <target> [--mac AA:BB:CC:DD:EE:FF] [--broadcast IP] [--relay NODE_ID]")
+	targetArg := ""
+	if rest := fs.Args(); len(rest) > 0 {
+		targetArg = rest[0]
+		if len(rest) > 1 {
+			if err := fs.Parse(rest[1:]); err != nil {
+				return err
+			}
+		}
+	}
+	if targetArg == "" && *mac == "" {
+		return errors.New("usage: sf wake <target> [--mac AA:BB:CC:DD:EE:FF] [--broadcast IP] [--relay NODE_ID] [--unlock-keyring]")
 	}
 
 	cfg, err := vault.LoadOrInitConfig(configPath())
@@ -489,7 +547,10 @@ func cmdWake(args []string) error {
 		return err
 	}
 
-	if fs.NArg() == 0 && *mac != "" {
+	if targetArg == "" && *mac != "" {
+		if *unlockKeyring {
+			return errors.New("--unlock-keyring requires a Hub target node")
+		}
 		if err := wol.SendMagicPacket(*mac, *bcast, 9, 7); err != nil {
 			return err
 		}
@@ -501,7 +562,7 @@ func cmdWake(args []string) error {
 	if err != nil {
 		return err
 	}
-	target, err := resolveTarget(cfg, v, fs.Arg(0))
+	target, err := resolveTarget(cfg, v, targetArg)
 	if err != nil {
 		return err
 	}
@@ -524,12 +585,23 @@ func cmdWake(args []string) error {
 	}
 
 	if target.NodeID != "" && cfg.HubURL != "" {
+		var keyringPw string
+		if *unlockKeyring {
+			keyringPw, err = getKeyringPassword()
+			if err != nil {
+				return err
+			}
+		}
 		return executePower(cfg, target, protocol.PowerRequest{
-			Action:      protocol.ActionWake,
-			MAC:         useMAC,
-			BroadcastIP: useBcast,
-			RelayNodeID: useRelay,
+			Action:          protocol.ActionWake,
+			MAC:             useMAC,
+			BroadcastIP:     useBcast,
+			RelayNodeID:     useRelay,
+			KeyringPassword: keyringPw,
 		})
+	}
+	if *unlockKeyring {
+		return errors.New("--unlock-keyring requires a Hub-connected node")
 	}
 	if useMAC != "" {
 		if err := wol.SendMagicPacket(useMAC, useBcast, 9, 7); err != nil {
@@ -539,6 +611,65 @@ func cmdWake(args []string) error {
 		return nil
 	}
 	return errors.New("cannot wake target: neither Hub node nor MAC address configured")
+}
+
+func cmdUnlockKeyring(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: sf unlock-keyring <target>")
+	}
+	cfg, err := vault.LoadOrInitConfig(configPath())
+	if err != nil {
+		return err
+	}
+	v, _, err := tryLoadVault(cfg, false)
+	if err != nil {
+		return err
+	}
+	target, err := resolveTarget(cfg, v, args[0])
+	if err != nil {
+		return err
+	}
+	if cfg.HubURL == "" || cfg.HubToken == "" {
+		return errors.New("hub_url and hub_token must be configured via `sf config set`")
+	}
+	nodeID := target.NodeID
+	if nodeID == "" {
+		nodeID = target.Name
+	}
+	pw, err := getKeyringPassword()
+	if err != nil {
+		return err
+	}
+
+	b, _ := json.Marshal(protocol.UnlockKeyringRequest{Password: pw})
+	endpoint := fmt.Sprintf("%s/api/v1/nodes/%s/unlock-keyring", strings.TrimRight(cfg.HubURL, "/"), nodeID)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.HubToken)
+	req.Header.Set("Content-Type", "application/json")
+	addCFHeaders(req, cfg)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var out protocol.UnlockKeyringResponse
+	if err := decodeAPIResponse(resp, &out); err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK || !out.OK {
+		if out.Error == "" {
+			out.Error = resp.Status
+		}
+		return fmt.Errorf("unlock-keyring failed on %s: %s", nodeID, out.Error)
+	}
+	fmt.Printf("OK [unlock-keyring] -> node=%s\n", out.NodeID)
+	return nil
 }
 
 func cmdSleep(args []string) error {
@@ -570,6 +701,25 @@ func cmdSleep(args []string) error {
 		return err
 	}
 	return executePower(cfg, target, protocol.PowerRequest{Action: action})
+}
+
+func cmdPowerOff(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: sf poweroff <target>")
+	}
+	cfg, err := vault.LoadOrInitConfig(configPath())
+	if err != nil {
+		return err
+	}
+	v, _, err := tryLoadVault(cfg, false)
+	if err != nil {
+		return err
+	}
+	target, err := resolveTarget(cfg, v, args[0])
+	if err != nil {
+		return err
+	}
+	return executePower(cfg, target, protocol.PowerRequest{Action: protocol.ActionPowerOff})
 }
 
 func cmdKeepAwake(args []string) error {
@@ -620,7 +770,7 @@ func executePower(cfg vault.LocalConfig, target ui.FleetTarget, reqBody protocol
 	req.Header.Set("Content-Type", "application/json")
 	addCFHeaders(req, cfg)
 
-	client := &http.Client{Timeout: 12 * time.Second}
+	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -628,15 +778,27 @@ func executePower(cfg vault.LocalConfig, target ui.FleetTarget, reqBody protocol
 	defer resp.Body.Close()
 
 	var out protocol.PowerResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := decodeAPIResponse(resp, &out); err != nil {
 		return err
 	}
 	if !out.OK {
+		if out.Error == "" {
+			out.Error = resp.Status
+		}
 		return fmt.Errorf("power action %s failed on %s: %s", reqBody.Action, nodeID, out.Error)
 	}
 	fmt.Printf("OK [%s] -> node=%s method=%s state=%s", reqBody.Action, out.NodeID, out.Method, out.PowerState)
 	if len(out.Relays) > 0 {
 		fmt.Printf(" relays=%v", out.Relays)
+	}
+	if out.UnlockQueued {
+		fmt.Printf(" unlock_queued=true")
+	}
+	if out.KeyringUnlocked {
+		fmt.Printf(" keyring_unlocked=true")
+	}
+	if out.KeyringError != "" {
+		fmt.Printf(" keyring_error=%q", out.KeyringError)
 	}
 	fmt.Println()
 	return nil
@@ -1275,7 +1437,7 @@ func exchangeJoinToken(hubURL, joinToken, nodeID string, extraHeaders map[string
 		NodeToken string `json:"node_token"`
 		Error     string `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := decodeAPIResponse(resp, &out); err != nil {
 		return "", err
 	}
 	if resp.StatusCode != http.StatusOK || !out.OK || out.NodeToken == "" {

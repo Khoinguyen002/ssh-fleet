@@ -228,6 +228,7 @@ func pickAction(reader *bufio.Reader, target FleetTarget) (*SelectorChoice, erro
 	fmt.Println("  [w]         Wake (Soft-Wake or LAN Relay WoL)")
 	fmt.Println("  [z]         Soft-Sleep (screen off + lock, keep network alive)")
 	fmt.Println("  [H]         Hard-Sleep (OS Suspend-to-RAM)")
+	fmt.Println("  [P]         Power Off (OS Shutdown)")
 	fmt.Println("  [k]         Keep-Awake ON")
 	fmt.Println("  [o]         Keep-Awake OFF")
 	fmt.Println("  [b]         Back")
@@ -254,6 +255,9 @@ func pickAction(reader *bufio.Reader, target FleetTarget) (*SelectorChoice, erro
 	default:
 		if act == "H" {
 			return &SelectorChoice{Target: target, Action: "hard-sleep"}, nil
+		}
+		if act == "P" {
+			return &SelectorChoice{Target: target, Action: "poweroff"}, nil
 		}
 		return &SelectorChoice{Target: target, Action: "ssh"}, nil
 	}
