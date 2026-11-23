@@ -1,4 +1,6 @@
 /sf
 /dist/
+/android/build/
+/android/*.keystore
 *.log
 .DS_Store

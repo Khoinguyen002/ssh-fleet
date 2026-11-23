@@ -12,8 +12,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -73,33 +76,59 @@ type pendingAck struct {
 	ch chan protocol.ControlFrame
 }
 
+type Options struct {
+	Token         string
+	DataDir       string
+	TrustCFAccess bool
+	CFAccessEmail string
+}
+
 type Server struct {
-	token      string
-	dataDir    string
-	mu         sync.RWMutex
-	nodes      map[string]*protocol.NodeInfo
-	agents     map[string]*activeAgent
-	pendingReq map[string]*pendingAck
-	streams    map[string]chan net.Conn
-	httpSrv    *http.Server
+	token         string
+	dataDir       string
+	trustCFAccess bool
+	cfEmails      []string
+	mu            sync.RWMutex
+	nodes         map[string]*protocol.NodeInfo
+	agents        map[string]*activeAgent
+	pendingReq    map[string]*pendingAck
+	streams       map[string]chan net.Conn
+	httpSrv       *http.Server
 }
 
 func NewServer(token, dataDir string) (*Server, error) {
-	if strings.TrimSpace(token) == "" {
+	return NewServerWithOptions(Options{
+		Token:   token,
+		DataDir: dataDir,
+	})
+}
+
+func NewServerWithOptions(opts Options) (*Server, error) {
+	if strings.TrimSpace(opts.Token) == "" {
 		return nil, errors.New("hub token cannot be empty")
 	}
-	if dataDir != "" {
-		if err := os.MkdirAll(dataDir, 0700); err != nil {
+	if opts.DataDir != "" {
+		if err := os.MkdirAll(opts.DataDir, 0700); err != nil {
 			return nil, err
 		}
 	}
+	var emails []string
+	for _, e := range strings.Split(opts.CFAccessEmail, ",") {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e != "" {
+			emails = append(emails, e)
+		}
+	}
+	trustCF := opts.TrustCFAccess || len(emails) > 0
 	s := &Server{
-		token:      token,
-		dataDir:    dataDir,
-		nodes:      make(map[string]*protocol.NodeInfo),
-		agents:     make(map[string]*activeAgent),
-		pendingReq: make(map[string]*pendingAck),
-		streams:    make(map[string]chan net.Conn),
+		token:         opts.Token,
+		dataDir:       opts.DataDir,
+		trustCFAccess: trustCF,
+		cfEmails:      emails,
+		nodes:         make(map[string]*protocol.NodeInfo),
+		agents:        make(map[string]*activeAgent),
+		pendingReq:    make(map[string]*pendingAck),
+		streams:       make(map[string]chan net.Conn),
 	}
 	s.loadPersistedNodes()
 	return s, nil
@@ -111,12 +140,16 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
+	mux.HandleFunc("/api/v1/auth/status", s.handleAuthStatus)
+	mux.HandleFunc("/api/v1/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/v1/ws/terminal", s.withAuth(s.handleTerminalWS))
 	mux.HandleFunc("/api/v1/nodes", s.withAuth(s.handleListNodes))
 	mux.HandleFunc("/api/v1/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/v1/vault", s.withAuth(s.handleVault))
 	mux.HandleFunc("/tunnel/control", s.withAuth(s.handleControlTunnel))
 	mux.HandleFunc("/tunnel/agent-stream", s.withAuth(s.handleAgentStream))
 	mux.HandleFunc("/tunnel/client-proxy", s.withAuth(s.handleClientProxy))
+	mux.Handle("/", webHandler())
 	return mux
 }
 
@@ -141,21 +174,92 @@ func (s *Server) Close() error {
 	return nil
 }
 
+func (s *Server) isAuthorized(r *http.Request) (bool, string) {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	const prefix = "Bearer "
+	if strings.HasPrefix(auth, prefix) {
+		got := strings.TrimPrefix(auth, prefix)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1 {
+			return true, ""
+		}
+	}
+
+	if c, err := r.Cookie("sf_token"); err == nil && c.Value != "" {
+		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(s.token)) == 1 {
+			return true, ""
+		}
+	}
+
+	if qTok := strings.TrimSpace(r.URL.Query().Get("token")); qTok != "" {
+		if subtle.ConstantTimeCompare([]byte(qTok), []byte(s.token)) == 1 {
+			return true, ""
+		}
+	}
+
+	if s.trustCFAccess {
+		cfEmail := strings.ToLower(strings.TrimSpace(r.Header.Get("Cf-Access-Authenticated-User-Email")))
+		if cfEmail != "" {
+			if len(s.cfEmails) == 0 {
+				return true, cfEmail
+			}
+			for _, allowed := range s.cfEmails {
+				if cfEmail == allowed {
+					return true, cfEmail
+				}
+			}
+		} else if len(s.cfEmails) == 0 && strings.TrimSpace(r.Header.Get("Cf-Access-Jwt-Assertion")) != "" {
+			return true, "cf-access-user"
+		}
+	}
+
+	return false, ""
+}
+
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		auth := strings.TrimSpace(r.Header.Get("Authorization"))
-		const prefix = "Bearer "
-		if !strings.HasPrefix(auth, prefix) {
-			http.Error(w, `{"ok":false,"error":"unauthorized"}`, http.StatusUnauthorized)
-			return
-		}
-		got := strings.TrimPrefix(auth, prefix)
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
+		ok, _ := s.isAuthorized(r)
+		if !ok {
 			http.Error(w, `{"ok":false,"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
 	}
+}
+
+func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	ok, cfEmail := s.isAuthorized(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"authenticated": ok,
+		"cf_email":      cfEmail,
+	})
+}
+
+func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid body"})
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(body.Token)), []byte(s.token)) != 1 {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "invalid token"})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sf_token",
+		Value:    s.token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   86400 * 30,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) stateFilePath() string {
@@ -741,6 +845,246 @@ func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
 
 	wrappedClient := wrapHijackedConn(clientConn, rw)
 	spliceConns(wrappedClient, agentConn)
+}
+
+func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
+	ws, err := UpgradeWebSocket(w, r)
+	if err != nil {
+		return
+	}
+	defer ws.Close()
+
+	mode := strings.TrimSpace(r.URL.Query().Get("mode"))
+	if mode == "" {
+		mode = "agent"
+	}
+
+	if mode == "agent" {
+		nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
+		if nodeID == "" {
+			_ = ws.WriteText("missing node_id\r\n")
+			return
+		}
+		s.mu.RLock()
+		agent := s.agents[nodeID]
+		s.mu.RUnlock()
+		if agent == nil {
+			_ = ws.WriteText("target agent is offline\r\n")
+			return
+		}
+
+		streamID := newRandomID(12)
+		streamCh := make(chan net.Conn, 1)
+		s.mu.Lock()
+		s.streams[streamID] = streamCh
+		s.mu.Unlock()
+		defer func() {
+			s.mu.Lock()
+			delete(s.streams, streamID)
+			s.mu.Unlock()
+		}()
+
+		if err := agent.send(protocol.ControlFrame{
+			Type:     "open-shell-stream",
+			StreamID: streamID,
+		}); err != nil {
+			_ = ws.WriteText("failed to contact agent\r\n")
+			return
+		}
+
+		var agentConn net.Conn
+		select {
+		case agentConn = <-streamCh:
+		case <-time.After(10 * time.Second):
+			_ = ws.WriteText("timed out waiting for agent shell stream\r\n")
+			return
+		case <-r.Context().Done():
+			return
+		}
+		defer agentConn.Close()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 4096)
+			for {
+				n, rErr := agentConn.Read(buf)
+				if n > 0 {
+					if wErr := ws.WriteBinary(buf[:n]); wErr != nil {
+						break
+					}
+				}
+				if rErr != nil {
+					break
+				}
+			}
+			_ = ws.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			for {
+				op, payload, rErr := ws.ReadMessage()
+				if rErr != nil {
+					break
+				}
+				if op == 0x1 || op == 0x2 {
+					if _, wErr := agentConn.Write(payload); wErr != nil {
+						break
+					}
+				}
+			}
+			_ = agentConn.Close()
+		}()
+		wg.Wait()
+		return
+	}
+
+	// mode == "ssh": read initial JSON spec from WebSocket.
+	_, initPayload, err := ws.ReadMessage()
+	if err != nil {
+		return
+	}
+	var spec struct {
+		Host       string `json:"host"`
+		Port       int    `json:"port"`
+		User       string `json:"user"`
+		NodeID     string `json:"node_id"`
+		PrivateKey string `json:"private_key"`
+	}
+	if err := json.Unmarshal(initPayload, &spec); err != nil {
+		_ = ws.WriteText("invalid ssh session spec\r\n")
+		return
+	}
+
+	var tempFiles []string
+	defer func() {
+		for _, f := range tempFiles {
+			_ = os.Remove(f)
+		}
+	}()
+
+	sshArgs := []string{"-tt", "-o", "StrictHostKeyChecking=accept-new"}
+	if strings.TrimSpace(spec.PrivateKey) != "" {
+		kf, kErr := os.CreateTemp("", "sf-webssh-key-*")
+		if kErr == nil {
+			keyStr := spec.PrivateKey
+			if !strings.HasSuffix(keyStr, "\n") {
+				keyStr += "\n"
+			}
+			_, _ = kf.WriteString(keyStr)
+			_ = kf.Chmod(0600)
+			_ = kf.Close()
+			tempFiles = append(tempFiles, kf.Name())
+			sshArgs = append(sshArgs, "-i", kf.Name(), "-o", "IdentitiesOnly=yes")
+		}
+	}
+
+	if spec.NodeID != "" {
+		selfBin, _ := os.Executable()
+		if selfBin != "" {
+			listenAddr := "127.0.0.1:8090"
+			if s.httpSrv != nil && s.httpSrv.Addr != "" {
+				if strings.HasPrefix(s.httpSrv.Addr, ":") {
+					listenAddr = "127.0.0.1" + s.httpSrv.Addr
+				} else {
+					listenAddr = s.httpSrv.Addr
+				}
+			}
+			_ = listenAddr
+			// Spawn internal loopback bridge if needed; simplest portable path uses local sf config or agent stream.
+			sshArgs = append(sshArgs, "-o", fmt.Sprintf("ProxyCommand=\"%s\" proxy %s", selfBin, spec.NodeID))
+		}
+		dest := spec.NodeID
+		if spec.User != "" {
+			dest = spec.User + "@" + dest
+		}
+		sshArgs = append(sshArgs, dest)
+	} else {
+		if spec.Port > 0 && spec.Port != 22 {
+			sshArgs = append(sshArgs, "-p", strconv.Itoa(spec.Port))
+		}
+		dest := spec.Host
+		if spec.User != "" {
+			dest = spec.User + "@" + dest
+		}
+		sshArgs = append(sshArgs, dest)
+	}
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "linux" {
+		if _, err := exec.LookPath("script"); err == nil {
+			quoted := "ssh"
+			for _, a := range sshArgs {
+				quoted += " '" + strings.ReplaceAll(a, "'", "'\"'\"'") + "'"
+			}
+			cmd = exec.Command("script", "-q", "-c", quoted, "/dev/null")
+		}
+	}
+	if cmd == nil {
+		cmd = exec.Command("ssh", sshArgs...)
+	}
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		_ = ws.WriteText("stdin pipe error: " + err.Error() + "\r\n")
+		return
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = ws.WriteText("stdout pipe error: " + err.Error() + "\r\n")
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = ws.WriteText("stderr pipe error: " + err.Error() + "\r\n")
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		_ = ws.WriteText("failed to start ssh: " + err.Error() + "\r\n")
+		return
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	pipeOut := func(rd io.Reader) {
+		defer wg.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, rErr := rd.Read(buf)
+			if n > 0 {
+				if wErr := ws.WriteBinary(buf[:n]); wErr != nil {
+					break
+				}
+			}
+			if rErr != nil {
+				break
+			}
+		}
+	}
+	go pipeOut(stdout)
+	go pipeOut(stderr)
+
+	go func() {
+		for {
+			op, payload, rErr := ws.ReadMessage()
+			if rErr != nil {
+				break
+			}
+			if op == 0x1 || op == 0x2 {
+				if _, wErr := stdin.Write(payload); wErr != nil {
+					break
+				}
+			}
+		}
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}()
+
+	wg.Wait()
+	_ = cmd.Wait()
 }
 
 func spliceConns(a, b net.Conn) {

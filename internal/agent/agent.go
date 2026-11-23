@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -26,6 +27,8 @@ import (
 type Options struct {
 	HubURL         string
 	Token          string
+	CFClientID     string
+	CFClientSecret string
 	NodeID         string
 	Name           string
 	SSHPort        int
@@ -158,7 +161,7 @@ func (c *Client) buildNodeInfo() protocol.NodeInfo {
 }
 
 func (c *Client) connectOnce(ctx context.Context) error {
-	conn, br, err := DialUpgrade(ctx, c.opts.HubURL, "/tunnel/control", c.opts.Token, "ssh-fleet-control")
+	conn, br, err := DialUpgradeWithHeaders(ctx, c.opts.HubURL, "/tunnel/control", c.opts.Token, "ssh-fleet-control", c.cfHeaders())
 	if err != nil {
 		return err
 	}
@@ -232,6 +235,8 @@ func (c *Client) connectOnce(ctx context.Context) error {
 		switch frame.Type {
 		case "open-ssh-stream":
 			go c.handleOpenStream(ctx, frame.StreamID)
+		case "open-shell-stream":
+			go c.handleOpenShellStream(ctx, frame.StreamID)
 		case "power-cmd":
 			go c.handlePowerCmd(sendFrame, frame)
 		case "wol-cmd":
@@ -245,6 +250,17 @@ func (c *Client) connectOnce(ctx context.Context) error {
 	return io.EOF
 }
 
+func (c *Client) cfHeaders() map[string]string {
+	h := map[string]string{}
+	if strings.TrimSpace(c.opts.CFClientID) != "" {
+		h["CF-Access-Client-Id"] = c.opts.CFClientID
+	}
+	if strings.TrimSpace(c.opts.CFClientSecret) != "" {
+		h["CF-Access-Client-Secret"] = c.opts.CFClientSecret
+	}
+	return h
+}
+
 func (c *Client) handleOpenStream(ctx context.Context, streamID string) {
 	if streamID == "" {
 		return
@@ -254,13 +270,120 @@ func (c *Client) handleOpenStream(ctx context.Context, streamID string) {
 		return
 	}
 
-	remoteConn, br, err := DialUpgrade(ctx, c.opts.HubURL, "/tunnel/agent-stream?stream_id="+url.QueryEscape(streamID), c.opts.Token, "ssh-fleet-stream")
+	remoteConn, br, err := DialUpgradeWithHeaders(ctx, c.opts.HubURL, "/tunnel/agent-stream?stream_id="+url.QueryEscape(streamID), c.opts.Token, "ssh-fleet-stream", c.cfHeaders())
 	if err != nil {
 		_ = localConn.Close()
 		return
 	}
 
 	spliceBuffered(localConn, remoteConn, br)
+}
+
+func (c *Client) handleOpenShellStream(ctx context.Context, streamID string) {
+	if streamID == "" {
+		return
+	}
+	remoteConn, br, err := DialUpgradeWithHeaders(ctx, c.opts.HubURL, "/tunnel/agent-stream?stream_id="+url.QueryEscape(streamID), c.opts.Token, "ssh-fleet-stream", c.cfHeaders())
+	if err != nil {
+		return
+	}
+	defer remoteConn.Close()
+
+	cmd := buildInteractiveShellCmd()
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		_, _ = fmt.Fprintf(remoteConn, "failed to start shell: %v\r\n", err)
+		return
+	}
+
+	var writeM sync.Mutex
+	safeWrite := func(p []byte) error {
+		writeM.Lock()
+		defer writeM.Unlock()
+		_, wErr := remoteConn.Write(p)
+		return wErr
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, rErr := stdout.Read(buf)
+			if n > 0 {
+				if err := safeWrite(buf[:n]); err != nil {
+					break
+				}
+			}
+			if rErr != nil {
+				break
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, rErr := stderr.Read(buf)
+			if n > 0 {
+				if err := safeWrite(buf[:n]); err != nil {
+					break
+				}
+			}
+			if rErr != nil {
+				break
+			}
+		}
+	}()
+
+	go func() {
+		_, _ = io.Copy(stdin, br)
+		_ = stdin.Close()
+	}()
+
+	wg.Wait()
+	_ = cmd.Wait()
+}
+
+func buildInteractiveShellCmd() *exec.Cmd {
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("powershell.exe", "-NoLogo")
+	case "darwin":
+		sh := os.Getenv("SHELL")
+		if sh == "" {
+			sh = "/bin/zsh"
+		}
+		if _, err := exec.LookPath("script"); err == nil {
+			return exec.Command("script", "-q", "/dev/null", sh, "-i")
+		}
+		return exec.Command(sh, "-i")
+	default:
+		sh := os.Getenv("SHELL")
+		if sh == "" {
+			if _, err := exec.LookPath("bash"); err == nil {
+				sh = "/bin/bash"
+			} else {
+				sh = "/bin/sh"
+			}
+		}
+		if _, err := exec.LookPath("script"); err == nil {
+			return exec.Command("script", "-q", "-c", sh+" -i", "/dev/null")
+		}
+		return exec.Command(sh, "-i")
+	}
 }
 
 func (c *Client) handlePowerCmd(sendFrame func(protocol.ControlFrame) error, frame protocol.ControlFrame) {
@@ -331,6 +454,11 @@ func (c *Client) handleWolCmd(sendFrame func(protocol.ControlFrame) error, frame
 
 // DialUpgrade opens a raw TCP/TLS HTTP/1.1 Upgrade connection to the Hub.
 func DialUpgrade(ctx context.Context, baseURL, pathWithQuery, token, proto string) (net.Conn, *bufio.Reader, error) {
+	return DialUpgradeWithHeaders(ctx, baseURL, pathWithQuery, token, proto, nil)
+}
+
+// DialUpgradeWithHeaders opens a raw TCP/TLS HTTP/1.1 Upgrade connection with optional extra headers (e.g. Cloudflare Access Service Token).
+func DialUpgradeWithHeaders(ctx context.Context, baseURL, pathWithQuery, token, proto string, extraHeaders map[string]string) (net.Conn, *bufio.Reader, error) {
 	u, err := url.Parse(strings.TrimRight(baseURL, "/"))
 	if err != nil {
 		return nil, nil, err
@@ -364,12 +492,20 @@ func DialUpgrade(ctx context.Context, baseURL, pathWithQuery, token, proto strin
 	basePath := strings.TrimRight(u.Path, "/")
 	reqTarget := basePath + pathWithQuery
 
+	var headerBuf strings.Builder
+	for k, v := range extraHeaders {
+		if strings.TrimSpace(v) != "" {
+			headerBuf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+		}
+	}
+
 	reqStr := fmt.Sprintf(
-		"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: %s\r\nAuthorization: Bearer %s\r\n\r\n",
+		"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: %s\r\nAuthorization: Bearer %s\r\n%s\r\n",
 		reqTarget,
 		u.Host,
 		proto,
 		token,
+		headerBuf.String(),
 	)
 	if _, err := conn.Write([]byte(reqStr)); err != nil {
 		_ = conn.Close()
@@ -400,8 +536,12 @@ func DialUpgrade(ctx context.Context, baseURL, pathWithQuery, token, proto strin
 }
 
 // PipeStdioToProxy opens a proxied SSH stream for a target node and pipes it over stdin/stdout (OpenSSH ProxyCommand).
-func PipeStdioToProxy(ctx context.Context, hubURL, token, nodeID string) error {
-	conn, br, err := DialUpgrade(ctx, hubURL, "/tunnel/client-proxy?node_id="+url.QueryEscape(nodeID), token, "ssh-fleet-proxy")
+func PipeStdioToProxy(ctx context.Context, hubURL, token, nodeID string, cfHeaders ...map[string]string) error {
+	var extra map[string]string
+	if len(cfHeaders) > 0 {
+		extra = cfHeaders[0]
+	}
+	conn, br, err := DialUpgradeWithHeaders(ctx, hubURL, "/tunnel/client-proxy?node_id="+url.QueryEscape(nodeID), token, "ssh-fleet-proxy", extra)
 	if err != nil {
 		return err
 	}

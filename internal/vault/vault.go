@@ -22,13 +22,15 @@ const (
 )
 
 type LocalConfig struct {
-	HubURL    string `json:"hub_url"`
-	HubToken  string `json:"hub_token"`
-	VaultPath string `json:"vault_path"`
-	KeysDir   string `json:"keys_dir"`
-	NodeID    string `json:"node_id"`
-	AgentName string `json:"agent_name"`
-	SSHPort   int    `json:"ssh_port"`
+	HubURL         string `json:"hub_url"`
+	HubToken       string `json:"hub_token"`
+	CFClientID     string `json:"cf_client_id,omitempty"`
+	CFClientSecret string `json:"cf_client_secret,omitempty"`
+	VaultPath      string `json:"vault_path"`
+	KeysDir        string `json:"keys_dir"`
+	NodeID         string `json:"node_id"`
+	AgentName      string `json:"agent_name"`
+	SSHPort        int    `json:"ssh_port"`
 }
 
 type HostEntry struct {

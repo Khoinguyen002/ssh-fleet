@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f19" />
+  <link rel="manifest" href="/manifest.json" />
+  <title>SSH Fleet</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --surface: #131a2a;
+      --surface-2: #1c253b;
+      --border: #283552;
+      --text: #e5ecf6;
+      --muted: #8b9bb8;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --purple: #a855f7;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(11, 15, 25, 0.92);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; }
+    .badge {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--accent);
+    }
+    .badge.ok { color: var(--green); border-color: rgba(34,197,94,0.4); }
+    .badge.warn { color: var(--amber); border-color: rgba(245,158,11,0.4); }
+    .badge.off { color: var(--muted); }
+    .container { max-width: 1040px; margin: 0 auto; padding: 14px; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+    input, button {
+      font: inherit;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      outline: none;
+    }
+    input {
+      background: var(--surface);
+      color: var(--text);
+      padding: 10px 12px;
+      flex: 1;
+      min-width: 180px;
+    }
+    input:focus { border-color: var(--accent); }
+    button {
+      background: var(--surface-2);
+      color: var(--text);
+      padding: 9px 13px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+      transition: transform 0.08s ease, border-color 0.15s ease;
+    }
+    button:active { transform: scale(0.97); }
+    button.primary { background: #0284c7; border-color: #38bdf8; color: #fff; }
+    button.wake { background: rgba(34,197,94,0.14); border-color: rgba(34,197,94,0.45); color: #86efac; }
+    button.sleep { background: rgba(168,85,247,0.14); border-color: rgba(168,85,247,0.45); color: #d8b4fe; }
+    button.danger { background: rgba(239,68,68,0.14); border-color: rgba(239,68,68,0.45); color: #fca5a5; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+    .card-title { font-size: 16px; font-weight: 700; word-break: break-word; }
+    .card-sub { font-size: 12px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+    .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+    .actions button { flex: 1 1 auto; padding: 8px 10px; font-size: 12px; }
+    .banner {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.72);
+      display: none; align-items: center; justify-content: center; padding: 16px; z-index: 50;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      width: 100%; max-width: 420px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 16px; padding: 18px;
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .term-drawer {
+      position: fixed; inset: 0; background: #070a12; z-index: 60;
+      display: none; flex-direction: column;
+    }
+    .term-drawer.open { display: flex; }
+    .term-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border);
+      gap: 8px;
+    }
+    #termWrap { flex: 1; min-height: 0; padding: 6px; overflow: hidden; }
+    #termFallback {
+      display: none; flex-direction: column; height: 100%; gap: 8px;
+    }
+    #termFallback pre {
+      flex: 1; margin: 0; overflow: auto; background: #000; color: #e2e8f0;
+      padding: 10px; border-radius: 8px; font-size: 13px; white-space: pre-wrap;
+    }
+    .touchbar {
+      display: flex; gap: 6px; overflow-x: auto; padding: 8px 10px;
+      background: var(--surface); border-top: 1px solid var(--border);
+    }
+    .touchbar button { flex: 0 0 auto; padding: 7px 11px; font-size: 12px; }
+    .touchbar button.active { background: #0284c7; border-color: #38bdf8; color: #fff; }
+    .toast {
+      position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+      background: #1e293b; border: 1px solid var(--accent); color: #fff;
+      padding: 10px 16px; border-radius: 10px; font-size: 13px; z-index: 80;
+      display: none; max-width: 90vw;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span>⚡ SSH Fleet</span>
+      <span id="authBadge" class="badge">Checking auth...</span>
+    </div>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <button id="vaultBtn" onclick="openVaultModal()">🔐 Unlock Vault</button>
+      <button onclick="refreshAll()">↻ Refresh</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <div id="loginBanner" class="banner" style="display:none;">
+      <div>
+        <strong>Hub Authentication Required</strong>
+        <div class="card-sub">Enter Hub Bearer Token (or enable Cloudflare Access on this domain).</div>
+      </div>
+      <div style="display:flex; gap:8px; flex:1; max-width:420px;">
+        <input id="tokenInput" type="password" placeholder="sf_... Hub token" />
+        <button class="primary" onclick="loginWithToken()">Login</button>
+      </div>
+    </div>
+
+    <div class="controls">
+      <input id="searchInput" type="search" placeholder="Fuzzy search host, IP, OS, power state, tags..." oninput="renderFleet()" />
+    </div>
+
+    <div id="fleetGrid" class="grid"></div>
+  </main>
+
+  <div id="vaultModal" class="modal-backdrop">
+    <div class="modal">
+      <div style="font-size:16px; font-weight:700;">🔐 Unlock E2EE Vault</div>
+      <div class="card-sub">Decrypted locally in your browser via WebCrypto (PBKDF2-SHA256 + AES-256-GCM). Your Master Password never leaves this device.</div>
+      <input id="vaultPwInput" type="password" placeholder="Vault Master Password" onkeydown="if(event.key==='Enter') unlockVault()" />
+      <div style="display:flex; gap:8px; justify-content:flex-end;">
+        <button onclick="closeVaultModal()">Cancel</button>
+        <button class="primary" onclick="unlockVault()">Decrypt</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="termDrawer" class="term-drawer">
+    <div class="term-head">
+      <div>
+        <strong id="termTitle">Terminal</strong>
+        <span id="termStatus" class="badge" style="margin-left:8px;">connecting</span>
+      </div>
+      <button class="danger" onclick="closeTerminal()">✕ Close</button>
+    </div>
+    <div id="termWrap">
+      <div id="xtermHost" style="width:100%; height:100%;"></div>
+      <div id="termFallback">
+        <pre id="fallbackLog"></pre>
+        <div style="display:flex; gap:8px;">
+          <input id="fallbackInput" type="text" placeholder="Type command and press Enter..." onkeydown="if(event.key==='Enter'){sendRaw(this.value+'\n'); this.value='';}" />
+          <button class="primary" onclick="const el=document.getElementById('fallbackInput'); sendRaw(el.value+'\n'); el.value='';">Send</button>
+        </div>
+      </div>
+    </div>
+    <div class="touchbar">
+      <button onclick="sendRaw('\x1b')">ESC</button>
+      <button onclick="sendRaw('\t')">TAB</button>
+      <button id="ctrlBtn" onclick="toggleCtrl()">CTRL</button>
+      <button onclick="sendRaw('\x03')">Ctrl+C</button>
+      <button onclick="sendRaw('\x04')">Ctrl+D</button>
+      <button onclick="sendRaw('\x1b[A')">↑</button>
+      <button onclick="sendRaw('\x1b[B')">↓</button>
+      <button onclick="sendRaw('\x1b[D')">←</button>
+      <button onclick="sendRaw('\x1b[C')">→</button>
+      <button onclick="pasteClipboard()">Paste</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <script>
+    let hubNodes = [];
+    let vaultData = null;
+    let bearerToken = localStorage.getItem('sf_token') || '';
+    let activeWS = null;
+    let term = null;
+    let fitAddon = null;
+    let ctrlSticky = false;
+
+    function showToast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.style.display = 'block';
+      clearTimeout(window._toastTimer);
+      window._toastTimer = setTimeout(() => { el.style.display = 'none'; }, 3400);
+    }
+
+    function authHeaders() {
+      const h = {};
+      if (bearerToken) h['Authorization'] = 'Bearer ' + bearerToken;
+      return h;
+    }
+
+    async function checkAuth() {
+      try {
+        const res = await fetch('/api/v1/auth/status', { headers: authHeaders(), credentials: 'include' });
+        const data = await res.json();
+        const badge = document.getElementById('authBadge');
+        if (data.authenticated) {
+          document.getElementById('loginBanner').style.display = 'none';
+          if (data.cf_email) {
+            badge.textContent = 'CF Access: ' + data.cf_email;
+            badge.className = 'badge ok';
+          } else {
+            badge.textContent = 'Authenticated';
+            badge.className = 'badge ok';
+          }
+          return true;
+        } else {
+          document.getElementById('loginBanner').style.display = 'flex';
+          badge.textContent = 'Locked';
+          badge.className = 'badge warn';
+          return false;
+        }
+      } catch (e) {
+        showToast('Auth check failed: ' + e.message);
+        return false;
+      }
+    }
+
+    async function loginWithToken() {
+      const val = document.getElementById('tokenInput').value.trim();
+      if (!val) return;
+      const res = await fetch('/api/v1/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ token: val })
+      });
+      if (!res.ok) {
+        showToast('Invalid Hub token');
+        return;
+      }
+      bearerToken = val;
+      localStorage.setItem('sf_token', val);
+      await refreshAll();
+    }
+
+    async function refreshAll() {
+      const ok = await checkAuth();
+      if (!ok) {
+        hubNodes = [];
+        renderFleet();
+        return;
+      }
+      try {
+        const res = await fetch('/api/v1/nodes', { headers: authHeaders(), credentials: 'include' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        hubNodes = data.nodes || [];
+      } catch (e) {
+        showToast('Failed to fetch nodes: ' + e.message);
+      }
+      renderFleet();
+    }
+
+    function openVaultModal() {
+      document.getElementById('vaultModal').classList.add('open');
+      setTimeout(() => document.getElementById('vaultPwInput').focus(), 50);
+    }
+    function closeVaultModal() {
+      document.getElementById('vaultModal').classList.remove('open');
+    }
+
+    function b64ToBytes(b64) {
+      const bin = atob(b64);
+      const arr = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      return arr;
+    }
+
+    async function unlockVault() {
+      const pw = document.getElementById('vaultPwInput').value;
+      if (!pw) return;
+      try {
+        const res = await fetch('/api/v1/vault', { headers: authHeaders(), credentials: 'include' });
+        if (!res.ok) throw new Error('No vault found on Hub (run `sf vault push` from CLI first)');
+        const env = await res.json();
+        if (env.magic !== 'SFV1' || env.kdf !== 'pbkdf2-sha256') {
+          throw new Error('Unsupported vault format');
+        }
+        const enc = new TextEncoder();
+        const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(pw), 'PBKDF2', false, ['deriveKey']);
+        const aesKey = await crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: b64ToBytes(env.salt), iterations: env.iter, hash: 'SHA-256' },
+          keyMaterial,
+          { name: 'AES-GCM', length: 256 },
+          false,
+          ['decrypt']
+        );
+        const aad = enc.encode(`${env.magic}|${env.kdf}|${env.iter}`);
+        const plainBuf = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: b64ToBytes(env.nonce), additionalData: aad },
+          aesKey,
+          b64ToBytes(env.ciphertext)
+        );
+        vaultData = JSON.parse(new TextDecoder().decode(plainBuf));
+        document.getElementById('vaultBtn').textContent = '🔓 Vault (' + (vaultData.hosts || []).length + ')';
+        closeVaultModal();
+        showToast('Vault decrypted locally');
+        renderFleet();
+      } catch (e) {
+        showToast('Unlock failed: ' + (e.message || 'wrong password'));
+      }
+    }
+
+    function mergeTargets() {
+      const byId = new Map();
+      for (const n of hubNodes) byId.set(n.node_id.toLowerCase(), n);
+      const used = new Set();
+      const list = [];
+
+      if (vaultData && Array.isArray(vaultData.hosts)) {
+        for (const h of vaultData.hosts) {
+          const nid = (h.node_id || '').toLowerCase();
+          const n = nid ? byId.get(nid) : null;
+          if (n) used.add(nid);
+          list.push({
+            name: h.name,
+            kind: n || h.via_hub ? 'hub-device' : 'vps',
+            host: h.host || (n && n.local_ips && n.local_ips[0]) || h.node_id,
+            user: h.user || (n && n.ssh_user) || '',
+            port: h.port || 22,
+            keyName: h.key_name || '',
+            viaHub: Boolean(h.via_hub || n),
+            nodeId: h.node_id || (n && n.node_id) || '',
+            os: n ? `${n.os}/${n.arch}` : 'ssh-vps',
+            online: n ? Boolean(n.online) : true,
+            powerState: n ? n.power_state : (h.via_hub ? 'offline' : 'static'),
+            mac: h.mac || (n && n.mac_addrs && n.mac_addrs[0]) || '',
+            broadcastIp: h.broadcast_ip || (n && n.broadcast_ip) || '',
+            relayNodeId: h.relay_node_id || '',
+            tags: h.tags || []
+          });
+        }
+      }
+
+      for (const n of hubNodes) {
+        if (used.has(n.node_id.toLowerCase())) continue;
+        list.push({
+          name: n.name || n.node_id,
+          kind: 'hub-device',
+          host: (n.local_ips && n.local_ips[0]) || n.node_id,
+          user: n.ssh_user || '',
+          port: n.ssh_port || 22,
+          viaHub: true,
+          nodeId: n.node_id,
+          os: `${n.os}/${n.arch}`,
+          online: Boolean(n.online),
+          powerState: n.power_state || (n.online ? 'active' : 'offline'),
+          mac: (n.mac_addrs && n.mac_addrs[0]) || '',
+          broadcastIp: n.broadcast_ip || '',
+          tags: []
+        });
+      }
+      return list;
+    }
+
+    function renderFleet() {
+      const q = document.getElementById('searchInput').value.trim().toLowerCase();
+      const tokens = q ? q.split(/\s+/) : [];
+      const items = mergeTargets().filter(t => {
+        if (!tokens.length) return true;
+        const hay = [t.name, t.nodeId, t.host, t.os, t.powerState, ...(t.tags || [])].join(' ').toLowerCase();
+        return tokens.every(tok => hay.includes(tok));
+      });
+
+      const grid = document.getElementById('fleetGrid');
+      if (!items.length) {
+        grid.innerHTML = '<div class="card"><div class="card-sub">No devices matched. Run <code>sf join</code> on a PC/Laptop or unlock your Vault.</div></div>';
+        return;
+      }
+
+      grid.innerHTML = items.map((t, idx) => {
+        const badgeClass = t.kind === 'vps' ? 'badge' : (t.online ? 'badge ok' : 'badge off');
+        const stateText = t.kind === 'vps' ? 'VPS' : (t.online ? `ON · ${t.powerState}` : `OFF · ${t.powerState}`);
+        const sub = [t.user ? `${t.user}@${t.host}` : t.host, t.os, t.mac].filter(Boolean).join(' · ');
+        const isKeepAwake = t.powerState === 'keep-awake';
+
+        return `
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">${esc(t.name)}</div>
+                <div class="card-sub">${esc(sub)}</div>
+              </div>
+              <span class="${badgeClass}">${esc(stateText)}</span>
+            </div>
+            <div class="actions">
+              ${t.kind === 'hub-device' && t.online ? `<button class="primary" onclick="openAgentTerminal('${escAttr(t.nodeId)}','${escAttr(t.name)}')">>_ Shell</button>` : ''}
+              ${(t.kind === 'vps' || t.online) ? `<button onclick="openSSHTerminal(${idx})">SSH</button>` : ''}
+              ${t.kind === 'hub-device' ? `<button class="wake" onclick="sendPower('${escAttr(t.nodeId)}','wake','${escAttr(t.mac)}','${escAttr(t.broadcastIp)}','${escAttr(t.relayNodeId)}')">⚡ Wake</button>` : ''}
+              ${t.kind === 'hub-device' && t.online ? `<button class="sleep" onclick="sendPower('${escAttr(t.nodeId)}','soft-sleep')">🌙 Soft Sleep</button>` : ''}
+              ${t.kind === 'hub-device' && t.online ? `<button onclick="sendPower('${escAttr(t.nodeId)}','${isKeepAwake ? 'keep-awake-off' : 'keep-awake-on'}')">☕ ${isKeepAwake ? 'Awake ON' : 'Keep Awake'}</button>` : ''}
+              ${t.kind === 'hub-device' && t.online ? `<button class="danger" onclick="confirmHardSleep('${escAttr(t.nodeId)}','${escAttr(t.name)}')">💤 Hard Sleep</button>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+      window._renderedItems = items;
+    }
+
+    function esc(s) {
+      return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function escAttr(s) { return esc(s).replace(/\\/g, '\\\\'); }
+
+    async function confirmHardSleep(nodeId, name) {
+      if (!confirm(`Suspend ${name} to RAM (Hard Sleep)? Requires Wake-on-LAN relay to wake.`)) return;
+      await sendPower(nodeId, 'hard-sleep');
+    }
+
+    async function sendPower(nodeId, action, mac, broadcastIp, relayNodeId) {
+      try {
+        const res = await fetch(`/api/v1/nodes/${encodeURIComponent(nodeId)}/power`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          credentials: 'include',
+          body: JSON.stringify({ action, mac: mac || undefined, broadcast_ip: broadcastIp || undefined, relay_node_id: relayNodeId || undefined })
+        });
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || 'failed');
+        showToast(`OK: ${action} on ${nodeId} (${data.method})`);
+        setTimeout(refreshAll, 500);
+      } catch (e) {
+        showToast('Power error: ' + e.message);
+      }
+    }
+
+    function wsURL(path) {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const tok = bearerToken ? `&token=${encodeURIComponent(bearerToken)}` : '';
+      return `${proto}//${location.host}${path}${tok}`;
+    }
+
+    function initTerminalSurface(title) {
+      document.getElementById('termTitle').textContent = title;
+      document.getElementById('termStatus').textContent = 'connecting';
+      document.getElementById('termDrawer').classList.add('open');
+
+      const hostEl = document.getElementById('xtermHost');
+      const fallbackEl = document.getElementById('termFallback');
+      hostEl.innerHTML = '';
+
+      if (window.Terminal) {
+        hostEl.style.display = 'block';
+        fallbackEl.style.display = 'none';
+        term = new window.Terminal({
+          cursorBlink: true,
+          fontSize: 14,
+          theme: { background: '#070a12', foreground: '#e5ecf6' }
+        });
+        if (window.FitAddon && window.FitAddon.FitAddon) {
+          fitAddon = new window.FitAddon.FitAddon();
+          term.loadAddon(fitAddon);
+        }
+        term.open(hostEl);
+        if (fitAddon) fitAddon.fit();
+        term.onData(d => {
+          if (ctrlSticky && d.length === 1) {
+            const code = d.toUpperCase().charCodeAt(0);
+            if (code >= 64 && code <= 95) d = String.fromCharCode(code - 64);
+            toggleCtrl(false);
+          }
+          sendRaw(d);
+        });
+        term.focus();
+      } else {
+        term = null;
+        hostEl.style.display = 'none';
+        fallbackEl.style.display = 'flex';
+        document.getElementById('fallbackLog').textContent = '';
+      }
+    }
+
+    function appendOutput(text) {
+      if (term) {
+        term.write(text);
+      } else {
+        const pre = document.getElementById('fallbackLog');
+        pre.textContent += text;
+        pre.scrollTop = pre.scrollHeight;
+      }
+    }
+
+    function openAgentTerminal(nodeId, name) {
+      initTerminalSurface(`Shell · ${name}`);
+      connectTerminalWS(wsURL(`/api/v1/ws/terminal?mode=agent&node_id=${encodeURIComponent(nodeId)}`), null);
+    }
+
+    function openSSHTerminal(idx) {
+      const t = (window._renderedItems || [])[idx];
+      if (!t) return;
+      let privKey = '';
+      if (t.keyName && vaultData && Array.isArray(vaultData.keys)) {
+        const found = vaultData.keys.find(k => k.name === t.keyName);
+        if (found) privKey = found.private_key_pem || '';
+      }
+      initTerminalSurface(`SSH · ${t.name}`);
+      connectTerminalWS(wsURL(`/api/v1/ws/terminal?mode=ssh`), {
+        host: t.host,
+        port: t.port || 22,
+        user: t.user || '',
+        node_id: t.viaHub ? t.nodeId : '',
+        private_key: privKey
+      });
+    }
+
+    function connectTerminalWS(url, initPayload) {
+      if (activeWS) { try { activeWS.close(); } catch {} }
+      const ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      activeWS = ws;
+      const dec = new TextDecoder();
+
+      ws.onopen = () => {
+        document.getElementById('termStatus').textContent = 'connected';
+        document.getElementById('termStatus').className = 'badge ok';
+        if (initPayload) ws.send(JSON.stringify(initPayload));
+      };
+      ws.onmessage = (ev) => {
+        const txt = typeof ev.data === 'string' ? ev.data : dec.decode(ev.data);
+        appendOutput(txt);
+      };
+      ws.onclose = () => {
+        document.getElementById('termStatus').textContent = 'disconnected';
+        document.getElementById('termStatus').className = 'badge off';
+        appendOutput('\r\n[session closed]\r\n');
+      };
+      ws.onerror = () => {
+        document.getElementById('termStatus').textContent = 'error';
+        document.getElementById('termStatus').className = 'badge warn';
+      };
+    }
+
+    function sendRaw(s) {
+      if (activeWS && activeWS.readyState === WebSocket.OPEN) {
+        activeWS.send(s);
+      }
+    }
+
+    function toggleCtrl(force) {
+      ctrlSticky = typeof force === 'boolean' ? force : !ctrlSticky;
+      document.getElementById('ctrlBtn').classList.toggle('active', ctrlSticky);
+    }
+
+    async function pasteClipboard() {
+      try {
+        const txt = await navigator.clipboard.readText();
+        if (txt) sendRaw(txt);
+      } catch {
+        const txt = prompt('Paste text to send:');
+        if (txt) sendRaw(txt);
+      }
+    }
+
+    function closeTerminal() {
+      if (activeWS) { try { activeWS.close(); } catch {} activeWS = null; }
+      if (term) { try { term.dispose(); } catch {} term = null; }
+      document.getElementById('termDrawer').classList.remove('open');
+    }
+
+    window.addEventListener('resize', () => { if (fitAddon && term) fitAddon.fit(); });
+    refreshAll();
+    setInterval(() => {
+      if (!document.getElementById('termDrawer').classList.contains('open')) refreshAll();
+    }, 10000);
+  </script>
+</body>
+</html>

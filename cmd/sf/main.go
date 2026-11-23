@@ -168,6 +168,26 @@ func tryLoadVault(cfg vault.LocalConfig, required bool) (*vault.VaultData, strin
 	return v, pw, nil
 }
 
+func addCFHeaders(req *http.Request, cfg vault.LocalConfig) {
+	if strings.TrimSpace(cfg.CFClientID) != "" {
+		req.Header.Set("CF-Access-Client-Id", cfg.CFClientID)
+	}
+	if strings.TrimSpace(cfg.CFClientSecret) != "" {
+		req.Header.Set("CF-Access-Client-Secret", cfg.CFClientSecret)
+	}
+}
+
+func cfHeaderMap(cfg vault.LocalConfig) map[string]string {
+	h := map[string]string{}
+	if strings.TrimSpace(cfg.CFClientID) != "" {
+		h["CF-Access-Client-Id"] = cfg.CFClientID
+	}
+	if strings.TrimSpace(cfg.CFClientSecret) != "" {
+		h["CF-Access-Client-Secret"] = cfg.CFClientSecret
+	}
+	return h
+}
+
 func fetchHubNodes(cfg vault.LocalConfig) ([]protocol.NodeInfo, error) {
 	if strings.TrimSpace(cfg.HubURL) == "" || strings.TrimSpace(cfg.HubToken) == "" {
 		return nil, nil
@@ -178,6 +198,7 @@ func fetchHubNodes(cfg vault.LocalConfig) ([]protocol.NodeInfo, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.HubToken)
+	addCFHeaders(req, cfg)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -225,6 +246,8 @@ func cmdConfig(args []string) error {
 		fs := flag.NewFlagSet("config set", flag.ContinueOnError)
 		hubURL := fs.String("hub", "", "Hub base URL (e.g. https://hub.example.com)")
 		token := fs.String("token", "", "Hub bearer token")
+		cfID := fs.String("cf-client-id", "", "Cloudflare Access Service Token Client ID")
+		cfSecret := fs.String("cf-client-secret", "", "Cloudflare Access Service Token Client Secret")
 		nodeID := fs.String("node-id", "", "Override local node ID")
 		name := fs.String("name", "", "Override local device name")
 		sshPort := fs.Int("ssh-port", 0, "Local SSH daemon port")
@@ -240,6 +263,12 @@ func cmdConfig(args []string) error {
 		}
 		if *token != "" {
 			cfg.HubToken = *token
+		}
+		if *cfID != "" {
+			cfg.CFClientID = *cfID
+		}
+		if *cfSecret != "" {
+			cfg.CFClientSecret = *cfSecret
 		}
 		if *nodeID != "" {
 			cfg.NodeID = *nodeID
@@ -589,6 +618,7 @@ func executePower(cfg vault.LocalConfig, target ui.FleetTarget, reqBody protocol
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.HubToken)
 	req.Header.Set("Content-Type", "application/json")
+	addCFHeaders(req, cfg)
 
 	client := &http.Client{Timeout: 12 * time.Second}
 	resp, err := client.Do(req)
@@ -659,6 +689,7 @@ func cmdVault(args []string) error {
 		}
 		req.Header.Set("Authorization", "Bearer "+cfg.HubToken)
 		req.Header.Set("Content-Type", "application/json")
+		addCFHeaders(req, cfg)
 		resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 		if err != nil {
 			return err
@@ -680,6 +711,7 @@ func cmdVault(args []string) error {
 			return err
 		}
 		req.Header.Set("Authorization", "Bearer "+cfg.HubToken)
+		addCFHeaders(req, cfg)
 		resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
 		if err != nil {
 			return err
@@ -939,6 +971,8 @@ func cmdHub(args []string) error {
 	dataDir := fs.String("data-dir", "", "Directory to persist node state and encrypted vault")
 	installSvc := fs.Bool("install-service", false, "Install and start Hub as a background service")
 	publicURL := fs.String("public-url", "", "Public URL of this Hub for join command output")
+	trustCF := fs.Bool("trust-cf-access", false, "Trust Cloudflare Access Zero Trust authenticated headers for Web UI & API")
+	cfEmail := fs.String("cf-access-email", os.Getenv("SF_CF_ACCESS_EMAIL"), "Comma-separated Cloudflare Access emails allowed (implies --trust-cf-access)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -962,18 +996,23 @@ func cmdHub(args []string) error {
 	}
 
 	if *installSvc {
-		return installAndStartHub(*listen, *token, *dataDir, *publicURL)
+		return installAndStartHub(*listen, *token, *dataDir, *publicURL, *trustCF, *cfEmail)
 	}
 
-	srv, err := hub.NewServer(*token, *dataDir)
+	srv, err := hub.NewServerWithOptions(hub.Options{
+		Token:         *token,
+		DataDir:       *dataDir,
+		TrustCFAccess: *trustCF,
+		CFAccessEmail: *cfEmail,
+	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ssh-fleet Hub listening on %s (dataDir=%s)\n", *listen, *dataDir)
+	fmt.Printf("ssh-fleet Hub listening on %s (dataDir=%s, cfAccess=%v)\n", *listen, *dataDir, *trustCF || *cfEmail != "")
 	return srv.ListenAndServe(*listen)
 }
 
-func installAndStartHub(listen, token, dataDir, publicURL string) error {
+func installAndStartHub(listen, token, dataDir, publicURL string, trustCF bool, cfEmail string) error {
 	selfBin, err := os.Executable()
 	if err != nil {
 		return err
@@ -993,6 +1032,17 @@ func installAndStartHub(listen, token, dataDir, publicURL string) error {
 	cfg.HubToken = token
 	_ = vault.SaveConfig(configPath(), cfg)
 
+	extraFlags := ""
+	extraArgs := []string{"hub", "--listen", listen, "--token", token, "--data-dir", dataDir}
+	if trustCF {
+		extraFlags += " --trust-cf-access"
+		extraArgs = append(extraArgs, "--trust-cf-access")
+	}
+	if strings.TrimSpace(cfEmail) != "" {
+		extraFlags += fmt.Sprintf(" --cf-access-email %q", cfEmail)
+		extraArgs = append(extraArgs, "--cf-access-email", cfEmail)
+	}
+
 	startedMsg := ""
 	switch runtime.GOOS {
 	case "linux":
@@ -1005,13 +1055,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart="%s" hub --listen "%s" --token "%s" --data-dir "%s"
+ExecStart="%s" hub --listen "%s" --token "%s" --data-dir "%s"%s
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-`, selfBin, listen, token, dataDir)
+`, selfBin, listen, token, dataDir, extraFlags)
 			if err := os.WriteFile(unitPath, []byte(unit), 0644); err != nil {
 				return err
 			}
@@ -1029,13 +1079,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart="%s" hub --listen "%s" --token "%s" --data-dir "%s"
+ExecStart="%s" hub --listen "%s" --token "%s" --data-dir "%s"%s
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=default.target
-`, selfBin, listen, token, dataDir)
+`, selfBin, listen, token, dataDir, extraFlags)
 			_ = os.WriteFile(unitPath, []byte(unit), 0644)
 			_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
 			if err := exec.Command("systemctl", "--user", "enable", "--now", "ssh-fleet-hub").Run(); err == nil {
@@ -1046,14 +1096,14 @@ WantedBy=default.target
 			}
 		}
 		if startedMsg == "" {
-			logPath, err := startDetachedProcess(selfBin, []string{"hub", "--listen", listen, "--token", token, "--data-dir", dataDir}, "hub.log")
+			logPath, err := startDetachedProcess(selfBin, extraArgs, "hub.log")
 			if err != nil {
 				return err
 			}
 			startedMsg = "detached background process (log: " + logPath + ")"
 		}
 	default:
-		logPath, err := startDetachedProcess(selfBin, []string{"hub", "--listen", listen, "--token", token, "--data-dir", dataDir}, "hub.log")
+		logPath, err := startDetachedProcess(selfBin, extraArgs, "hub.log")
 		if err != nil {
 			return err
 		}
@@ -1290,6 +1340,8 @@ func cmdAgent(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
 	hubURL := fs.String("hub", cfg.HubURL, "Hub URL")
 	token := fs.String("token", cfg.HubToken, "Hub bearer token")
+	cfID := fs.String("cf-client-id", cfg.CFClientID, "Cloudflare Access Client ID")
+	cfSecret := fs.String("cf-client-secret", cfg.CFClientSecret, "Cloudflare Access Client Secret")
 	nodeID := fs.String("node-id", cfg.NodeID, "Unique node ID")
 	name := fs.String("name", cfg.AgentName, "Display name")
 	sshPort := fs.Int("ssh-port", cfg.SSHPort, "Local SSH server port")
@@ -1322,11 +1374,13 @@ func cmdAgent(args []string) error {
 	}
 
 	client, err := agent.NewClient(agent.Options{
-		HubURL:  *hubURL,
-		Token:   *token,
-		NodeID:  *nodeID,
-		Name:    *name,
-		SSHPort: *sshPort,
+		HubURL:         *hubURL,
+		Token:          *token,
+		CFClientID:     *cfID,
+		CFClientSecret: *cfSecret,
+		NodeID:         *nodeID,
+		Name:           *name,
+		SSHPort:        *sshPort,
 	})
 	if err != nil {
 		return err
@@ -1351,5 +1405,5 @@ func cmdProxy(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return agent.PipeStdioToProxy(ctx, cfg.HubURL, cfg.HubToken, args[0])
+	return agent.PipeStdioToProxy(ctx, cfg.HubURL, cfg.HubToken, args[0], cfHeaderMap(cfg))
 }

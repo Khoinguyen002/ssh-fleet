@@ -31,6 +31,29 @@ Xong 1 lệnh đó là máy tự cài `sf`, tự chạy Agent ngầm, tự báo 
 
 ---
 
+## Truy cập trên mọi thiết bị qua Cloudflare Access & Android APK
+
+`sf hub` tích hợp sẵn giao diện Web Mobile (PWA) + Web Terminal (`xterm.js`) + giải mã E2EE Vault ngay trên trình duyệt bằng WebCrypto.
+
+### 1. Chạy Hub sau Cloudflare Tunnel + Cloudflare Access
+1. Trỏ Cloudflare Tunnel vào cổng Hub (ví dụ `http://127.0.0.1:8090` -> `https://ssh.domain-cua-may.com`).
+2. Bật chế độ tin cậy Cloudflare Access trên Hub (giới hạn đúng email của mày):
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Khoinguyen002/ssh-fleet/main/install.sh | bash -s -- hub --trust-cf-access --cf-access-email "email-cua-may@gmail.com"
+   ```
+   *(Hoặc dùng `sf hub --trust-cf-access --cf-access-email "..."`)*
+3. Khi mở `https://ssh.domain-cua-may.com` trên bất kỳ điện thoại/máy tính nào đã qua Cloudflare Access OTP/SSO, dashboard sẽ tự đăng nhập theo email Zero Trust của mày mà không cần nhập lại Hub Token!
+4. Nếu mày bật Cloudflare Access chặn cả API/tunnel cho `sf agent` ở các máy cá nhân, tạo **Cloudflare Access Service Token** rồi cấu hình:
+   ```bash
+   sf config set --hub https://ssh.domain-cua-may.com --token <HUB_TOKEN> --cf-client-id <ID> --cf-client-secret <SECRET>
+   ```
+
+### 2. Cài app Android (`.apk`) hoặc chạy CLI trên Termux
+- **App Android (`ssh-fleet-android.apk`)**: Tải từ [Releases](https://github.com/Khoinguyen002/ssh-fleet/releases/latest), cài vào máy, nhập URL `https://ssh.domain-cua-may.com` (hỗ trợ lưu cookie đăng nhập Cloudflare Access SSO, bàn phím phím tắt `Ctrl`/`Tab`/`Esc`/mũi tên).
+- **Termux trên Android**: Chạy thẳng lệnh `curl -fsSL https://raw.githubusercontent.com/Khoinguyen002/ssh-fleet/main/install.sh | bash` (đã có bản build `sf-linux-arm64`).
+
+---
+
 ## Cách hoạt động & Nơi lưu dữ liệu
 
 ```

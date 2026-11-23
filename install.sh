@@ -24,10 +24,6 @@ case "$ARCH_RAW" in
     ;;
 esac
 
-if [ "$OS" = "linux" ] && [ "$ARCH" = "arm64" ]; then
-  echo "Building or downloading linux-arm64 is not in default assets yet; checking..."
-fi
-
 ASSET="sf-${OS}-${ARCH}"
 URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
 

@@ -1,15 +1,19 @@
 package hub
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -286,5 +290,166 @@ func TestHubEndToEndProxyPowerWoLAndVaultSync(t *testing.T) {
 	_ = getResp.Body.Close()
 	if !bytes.Equal(gotBlob, vaultBlob) {
 		t.Fatalf("vault blob mismatch: got %q, want %q", gotBlob, vaultBlob)
+	}
+}
+
+func TestCloudflareAccessAuthAndWebSocketTerminal(t *testing.T) {
+	tmp := t.TempDir()
+	srv, err := NewServerWithOptions(Options{
+		Token:         "hub-tok",
+		DataDir:       tmp,
+		TrustCFAccess: true,
+		CFAccessEmail: "Khoi@example.com, admin@example.com",
+	})
+	if err != nil {
+		t.Fatalf("NewServerWithOptions: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	defer srv.Close()
+
+	// 1. Unauthorized without CF Access email or Bearer token
+	req0, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/auth/status", nil)
+	resp0, err := http.DefaultClient.Do(req0)
+	if err != nil {
+		t.Fatalf("auth status err: %v", err)
+	}
+	var st0 struct {
+		Authenticated bool `json:"authenticated"`
+	}
+	_ = json.NewDecoder(resp0.Body).Decode(&st0)
+	_ = resp0.Body.Close()
+	if st0.Authenticated {
+		t.Fatalf("expected unauthenticated without header")
+	}
+
+	// 2. Denied for unlisted CF Access email
+	reqDeny, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/nodes", nil)
+	reqDeny.Header.Set("Cf-Access-Authenticated-User-Email", "stranger@example.com")
+	respDeny, err := http.DefaultClient.Do(reqDeny)
+	if err != nil {
+		t.Fatalf("reqDeny err: %v", err)
+	}
+	_ = respDeny.Body.Close()
+	if respDeny.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unlisted email, got %d", respDeny.StatusCode)
+	}
+
+	// 3. Allowed for matching CF Access email (case-insensitive)
+	reqAllow, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/auth/status", nil)
+	reqAllow.Header.Set("Cf-Access-Authenticated-User-Email", "khoi@example.com")
+	respAllow, err := http.DefaultClient.Do(reqAllow)
+	if err != nil {
+		t.Fatalf("reqAllow err: %v", err)
+	}
+	var stAllow struct {
+		Authenticated bool   `json:"authenticated"`
+		CFEmail       string `json:"cf_email"`
+	}
+	_ = json.NewDecoder(respAllow.Body).Decode(&stAllow)
+	_ = respAllow.Body.Close()
+	if !stAllow.Authenticated || stAllow.CFEmail != "khoi@example.com" {
+		t.Fatalf("expected CF Access authenticated as khoi@example.com, got %+v", stAllow)
+	}
+
+	// 4. Web UI index served at "/"
+	webResp, err := http.Get(ts.URL + "/")
+	if err != nil || webResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET / failed: err=%v resp=%v", err, webResp)
+	}
+	webBytes, _ := io.ReadAll(webResp.Body)
+	_ = webResp.Body.Close()
+	if !strings.Contains(string(webBytes), "SSH Fleet") {
+		t.Fatalf("unexpected Web UI HTML")
+	}
+
+	// 5. Connect an agent and test WebSocket interactive agent shell stream via CF Access header
+	ag, err := agent.NewClient(agent.Options{
+		HubURL:       ts.URL,
+		Token:        "hub-tok",
+		NodeID:       "ws-test-node",
+		Name:         "ws-test-node",
+		PingInterval: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ag.Run(ctx) }()
+
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		nodes := srv.ListNodes()
+		if len(nodes) == 1 && nodes[0].Online {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	u, _ := url.Parse(ts.URL)
+	conn, err := net.DialTimeout("tcp", u.Host, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial ws tcp: %v", err)
+	}
+	defer conn.Close()
+
+	wsReq := fmt.Sprintf(
+		"GET /api/v1/ws/terminal?mode=agent&node_id=ws-test-node HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nCf-Access-Authenticated-User-Email: khoi@example.com\r\n\r\n",
+		u.Host,
+	)
+	if _, err := conn.Write([]byte(wsReq)); err != nil {
+		t.Fatalf("write ws upgrade: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(statusLine, "101") {
+		t.Fatalf("expected 101 websocket upgrade, got %q (err=%v)", statusLine, err)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read ws header: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	// Send masked client text frame: "echo WS_OK\nexit\n"
+	cmdBytes := []byte("echo WS_OK\nexit\n")
+	frame := []byte{0x81, 0x80 | byte(len(cmdBytes)), 0x11, 0x22, 0x33, 0x44}
+	for i, b := range cmdBytes {
+		frame = append(frame, b^frame[2+(i%4)])
+	}
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("write ws frame: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var collected strings.Builder
+	for i := 0; i < 30; i++ {
+		var hdr [2]byte
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			break
+		}
+		plen := int(hdr[1] & 0x7F)
+		if plen == 126 {
+			var ext [2]byte
+			_, _ = io.ReadFull(br, ext[:])
+			plen = int(binary.BigEndian.Uint16(ext[:]))
+		}
+		buf := make([]byte, plen)
+		_, err := io.ReadFull(br, buf)
+		if err != nil {
+			break
+		}
+		collected.Write(buf)
+		if strings.Contains(collected.String(), "WS_OK") {
+			break
+		}
+	}
+	if !strings.Contains(collected.String(), "WS_OK") {
+		t.Fatalf("expected WS_OK in terminal output, got: %q", collected.String())
 	}
 }
