@@ -1,0 +1,778 @@
+package hub
+
+import (
+	"bufio"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"ssh-fleet/internal/protocol"
+)
+
+type bufferedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (bc *bufferedConn) Read(p []byte) (int, error) {
+	return bc.r.Read(p)
+}
+
+func wrapHijackedConn(conn net.Conn, rw *bufio.ReadWriter) net.Conn {
+	if rw == nil || rw.Reader.Buffered() == 0 {
+		return conn
+	}
+	return &bufferedConn{
+		Conn: conn,
+		r:    io.MultiReader(rw.Reader, conn),
+	}
+}
+
+type activeAgent struct {
+	nodeID string
+	conn   net.Conn
+	writeM sync.Mutex
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (a *activeAgent) send(f protocol.ControlFrame) error {
+	b, err := json.Marshal(f)
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	a.writeM.Lock()
+	defer a.writeM.Unlock()
+	_ = a.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_, err = a.conn.Write(b)
+	_ = a.conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+func (a *activeAgent) close() {
+	a.once.Do(func() {
+		close(a.closed)
+		_ = a.conn.Close()
+	})
+}
+
+type pendingAck struct {
+	ch chan protocol.ControlFrame
+}
+
+type Server struct {
+	token      string
+	dataDir    string
+	mu         sync.RWMutex
+	nodes      map[string]*protocol.NodeInfo
+	agents     map[string]*activeAgent
+	pendingReq map[string]*pendingAck
+	streams    map[string]chan net.Conn
+	httpSrv    *http.Server
+}
+
+func NewServer(token, dataDir string) (*Server, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, errors.New("hub token cannot be empty")
+	}
+	if dataDir != "" {
+		if err := os.MkdirAll(dataDir, 0700); err != nil {
+			return nil, err
+		}
+	}
+	s := &Server{
+		token:      token,
+		dataDir:    dataDir,
+		nodes:      make(map[string]*protocol.NodeInfo),
+		agents:     make(map[string]*activeAgent),
+		pendingReq: make(map[string]*pendingAck),
+		streams:    make(map[string]chan net.Conn),
+	}
+	s.loadPersistedNodes()
+	return s, nil
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	mux.HandleFunc("/api/v1/nodes", s.withAuth(s.handleListNodes))
+	mux.HandleFunc("/api/v1/nodes/", s.withAuth(s.handleNodeAction))
+	mux.HandleFunc("/api/v1/vault", s.withAuth(s.handleVault))
+	mux.HandleFunc("/tunnel/control", s.withAuth(s.handleControlTunnel))
+	mux.HandleFunc("/tunnel/agent-stream", s.withAuth(s.handleAgentStream))
+	mux.HandleFunc("/tunnel/client-proxy", s.withAuth(s.handleClientProxy))
+	return mux
+}
+
+func (s *Server) ListenAndServe(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	s.httpSrv = &http.Server{Handler: s.Handler()}
+	return s.httpSrv.Serve(ln)
+}
+
+func (s *Server) Close() error {
+	s.mu.Lock()
+	for _, a := range s.agents {
+		a.close()
+	}
+	s.mu.Unlock()
+	if s.httpSrv != nil {
+		return s.httpSrv.Close()
+	}
+	return nil
+}
+
+func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := strings.TrimSpace(r.Header.Get("Authorization"))
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			http.Error(w, `{"ok":false,"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		got := strings.TrimPrefix(auth, prefix)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) != 1 {
+			http.Error(w, `{"ok":false,"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) stateFilePath() string {
+	if s.dataDir == "" {
+		return ""
+	}
+	return filepath.Join(s.dataDir, "hub-nodes.json")
+}
+
+func (s *Server) vaultFilePath() string {
+	if s.dataDir == "" {
+		return ""
+	}
+	return filepath.Join(s.dataDir, "vault.enc")
+}
+
+func (s *Server) loadPersistedNodes() {
+	p := s.stateFilePath()
+	if p == "" {
+		return
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	var list []protocol.NodeInfo
+	if err := json.Unmarshal(b, &list); err != nil {
+		return
+	}
+	for i := range list {
+		n := list[i]
+		n.Online = false
+		if n.PowerState != protocol.PowerSleeping {
+			n.PowerState = protocol.PowerOffline
+		}
+		s.nodes[n.NodeID] = &n
+	}
+}
+
+func (s *Server) persistNodesLocked() {
+	p := s.stateFilePath()
+	if p == "" {
+		return
+	}
+	list := make([]protocol.NodeInfo, 0, len(s.nodes))
+	for _, n := range s.nodes {
+		list = append(list, *n)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].NodeID < list[j].NodeID })
+	b, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(p, append(b, '\n'), 0600)
+}
+
+func (s *Server) ListNodes() []protocol.NodeInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]protocol.NodeInfo, 0, len(s.nodes))
+	for _, n := range s.nodes {
+		cp := *n
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Online != out[j].Online {
+			return out[i].Online
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"ok":    true,
+		"nodes": s.ListNodes(),
+	})
+}
+
+func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
+	vp := s.vaultFilePath()
+	if vp == "" {
+		http.Error(w, `{"ok":false,"error":"hub vault storage disabled"}`, http.StatusBadRequest)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		b, err := os.ReadFile(vp)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				http.Error(w, `{"ok":false,"error":"vault not found on hub"}`, http.StatusNotFound)
+				return
+			}
+			http.Error(w, fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(b)
+	case http.MethodPut:
+		body, err := io.ReadAll(io.LimitReader(r.Body, 8*1024*1024))
+		if err != nil || len(body) == 0 {
+			http.Error(w, `{"ok":false,"error":"empty vault payload"}`, http.StatusBadRequest)
+			return
+		}
+		if err := os.WriteFile(vp, body, 0600); err != nil {
+			http.Error(w, fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
+	trimmed := strings.TrimPrefix(r.URL.Path, "/api/v1/nodes/")
+	parts := strings.Split(strings.Trim(trimmed, "/"), "/")
+	if len(parts) != 2 || parts[1] != "power" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	nodeID := parts[0]
+	var req protocol.PowerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: "invalid request body"})
+		return
+	}
+
+	s.mu.RLock()
+	node, exists := s.nodes[nodeID]
+	var nodeCopy protocol.NodeInfo
+	if exists {
+		nodeCopy = *node
+	}
+	agent := s.agents[nodeID]
+	s.mu.RUnlock()
+
+	if req.Action == protocol.ActionWake {
+		if agent != nil {
+			ack, err := s.sendAndWait(agent, protocol.ControlFrame{
+				Type:   "power-cmd",
+				Action: string(protocol.ActionWake),
+			}, 6*time.Second)
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: err.Error()})
+				return
+			}
+			if !ack.OK {
+				writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: ack.Error})
+				return
+			}
+			s.updateNodePowerState(nodeID, ack.PowerState)
+			writeJSON(w, http.StatusOK, protocol.PowerResponse{
+				OK:         true,
+				NodeID:     nodeID,
+				Method:     "direct-soft-wake",
+				PowerState: ack.PowerState,
+			})
+			return
+		}
+
+		// Target is offline or sleeping: route Wake-on-LAN Magic Packet via online peer agents on the same LAN.
+		mac := strings.TrimSpace(req.MAC)
+		if mac == "" && exists && len(nodeCopy.MACAddrs) > 0 {
+			mac = nodeCopy.MACAddrs[0]
+		}
+		if mac == "" {
+			writeJSON(w, http.StatusBadRequest, protocol.PowerResponse{
+				OK:     false,
+				NodeID: nodeID,
+				Error:  "node is offline and no MAC address is known for Wake-on-LAN",
+			})
+			return
+		}
+		bcast := strings.TrimSpace(req.BroadcastIP)
+		if bcast == "" && exists {
+			bcast = nodeCopy.BroadcastIP
+		}
+
+		relays := s.selectRelayAgents(nodeID, &nodeCopy, req.RelayNodeID)
+		if len(relays) == 0 {
+			writeJSON(w, http.StatusServiceUnavailable, protocol.PowerResponse{
+				OK:     false,
+				NodeID: nodeID,
+				Error:  "no online relay agent available on LAN to transmit Wake-on-LAN packet",
+			})
+			return
+		}
+
+		var succeeded []string
+		var errs []string
+		for _, relay := range relays {
+			ack, err := s.sendAndWait(relay, protocol.ControlFrame{
+				Type:        "wol-cmd",
+				MAC:         mac,
+				BroadcastIP: bcast,
+			}, 5*time.Second)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", relay.nodeID, err))
+				continue
+			}
+			if !ack.OK {
+				errs = append(errs, fmt.Sprintf("%s: %s", relay.nodeID, ack.Error))
+				continue
+			}
+			succeeded = append(succeeded, relay.nodeID)
+		}
+		if len(succeeded) == 0 {
+			writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{
+				OK:     false,
+				NodeID: nodeID,
+				Error:  strings.Join(errs, "; "),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, protocol.PowerResponse{
+			OK:     true,
+			NodeID: nodeID,
+			Method: "wol-lan-relay",
+			Relays: succeeded,
+		})
+		return
+	}
+
+	if agent == nil {
+		writeJSON(w, http.StatusServiceUnavailable, protocol.PowerResponse{
+			OK:     false,
+			NodeID: nodeID,
+			Error:  "target node is offline",
+		})
+		return
+	}
+
+	ack, err := s.sendAndWait(agent, protocol.ControlFrame{
+		Type:   "power-cmd",
+		Action: string(req.Action),
+	}, 6*time.Second)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: err.Error()})
+		return
+	}
+	if !ack.OK {
+		writeJSON(w, http.StatusBadGateway, protocol.PowerResponse{OK: false, NodeID: nodeID, Error: ack.Error})
+		return
+	}
+	if ack.PowerState != "" {
+		s.updateNodePowerState(nodeID, ack.PowerState)
+	}
+	writeJSON(w, http.StatusOK, protocol.PowerResponse{
+		OK:         true,
+		NodeID:     nodeID,
+		Method:     "direct-agent",
+		PowerState: ack.PowerState,
+	})
+}
+
+func (s *Server) selectRelayAgents(targetID string, targetInfo *protocol.NodeInfo, preferredRelay string) []*activeAgent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if preferredRelay != "" {
+		if a := s.agents[preferredRelay]; a != nil {
+			return []*activeAgent{a}
+		}
+	}
+
+	targetSubnets := map[string]bool{}
+	if targetInfo != nil {
+		for _, cidr := range targetInfo.SubnetCIDRs {
+			targetSubnets[cidr] = true
+		}
+	}
+
+	var sameSubnet []*activeAgent
+	var allOnline []*activeAgent
+
+	for id, a := range s.agents {
+		if id == targetID {
+			continue
+		}
+		allOnline = append(allOnline, a)
+		if len(targetSubnets) > 0 {
+			if n, ok := s.nodes[id]; ok {
+				for _, cidr := range n.SubnetCIDRs {
+					if targetSubnets[cidr] {
+						sameSubnet = append(sameSubnet, a)
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if len(sameSubnet) > 0 {
+		return sameSubnet
+	}
+	return allOnline
+}
+
+func (s *Server) updateNodePowerState(nodeID string, state protocol.PowerState) {
+	if state == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n, ok := s.nodes[nodeID]; ok {
+		n.PowerState = state
+		n.LastSeen = time.Now().UTC()
+		s.persistNodesLocked()
+	}
+}
+
+func (s *Server) sendAndWait(agent *activeAgent, frame protocol.ControlFrame, timeout time.Duration) (protocol.ControlFrame, error) {
+	reqID := newRandomID(8)
+	frame.ReqID = reqID
+	ch := make(chan protocol.ControlFrame, 1)
+
+	s.mu.Lock()
+	s.pendingReq[reqID] = &pendingAck{ch: ch}
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.pendingReq, reqID)
+		s.mu.Unlock()
+	}()
+
+	if err := agent.send(frame); err != nil {
+		return protocol.ControlFrame{}, err
+	}
+
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-time.After(timeout):
+		return protocol.ControlFrame{}, errors.New("agent timed out acknowledging command")
+	case <-agent.closed:
+		return protocol.ControlFrame{}, errors.New("agent disconnected before acknowledging command")
+	}
+}
+
+func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	conn, rw, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+
+	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: ssh-fleet-control\r\nConnection: Upgrade\r\n\r\n")
+	if err := rw.Flush(); err != nil {
+		_ = conn.Close()
+		return
+	}
+
+	hConn := wrapHijackedConn(conn, rw)
+	scanner := bufio.NewScanner(hConn)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	if !scanner.Scan() {
+		_ = hConn.Close()
+		return
+	}
+
+	var reg protocol.ControlFrame
+	if err := json.Unmarshal(scanner.Bytes(), &reg); err != nil || reg.Type != "register" || reg.Node == nil || strings.TrimSpace(reg.Node.NodeID) == "" {
+		_ = hConn.Close()
+		return
+	}
+
+	now := time.Now().UTC()
+	node := *reg.Node
+	node.Online = true
+	if node.PowerState == "" || node.PowerState == protocol.PowerOffline || node.PowerState == protocol.PowerSleeping {
+		node.PowerState = protocol.PowerActive
+	}
+	node.ConnectedAt = now
+	node.LastSeen = now
+
+	agent := &activeAgent{
+		nodeID: node.NodeID,
+		conn:   hConn,
+		closed: make(chan struct{}),
+	}
+
+	s.mu.Lock()
+	if old := s.agents[node.NodeID]; old != nil {
+		old.close()
+	}
+	s.agents[node.NodeID] = agent
+	s.nodes[node.NodeID] = &node
+	s.persistNodesLocked()
+	s.mu.Unlock()
+
+	_ = agent.send(protocol.ControlFrame{Type: "register-ack", OK: true})
+
+	defer func() {
+		agent.close()
+		s.mu.Lock()
+		if s.agents[node.NodeID] == agent {
+			delete(s.agents, node.NodeID)
+			if n, exists := s.nodes[node.NodeID]; exists {
+				n.Online = false
+				n.LastSeen = time.Now().UTC()
+				if n.PowerState != protocol.PowerSleeping {
+					n.PowerState = protocol.PowerOffline
+				}
+				s.persistNodesLocked()
+			}
+		}
+		s.mu.Unlock()
+	}()
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var frame protocol.ControlFrame
+		if err := json.Unmarshal(line, &frame); err != nil {
+			continue
+		}
+
+		switch frame.Type {
+		case "ping":
+			s.mu.Lock()
+			if n, exists := s.nodes[node.NodeID]; exists {
+				n.LastSeen = time.Now().UTC()
+				if frame.PowerState != "" {
+					n.PowerState = frame.PowerState
+				}
+			}
+			s.mu.Unlock()
+			_ = agent.send(protocol.ControlFrame{Type: "pong"})
+		case "state-update":
+			s.mu.Lock()
+			if n, exists := s.nodes[node.NodeID]; exists {
+				if frame.Node != nil {
+					upd := *frame.Node
+					upd.Online = true
+					upd.ConnectedAt = n.ConnectedAt
+					upd.LastSeen = time.Now().UTC()
+					s.nodes[node.NodeID] = &upd
+				} else if frame.PowerState != "" {
+					n.PowerState = frame.PowerState
+					n.LastSeen = time.Now().UTC()
+				}
+				s.persistNodesLocked()
+			}
+			s.mu.Unlock()
+		case "power-ack", "wol-ack":
+			if frame.ReqID != "" {
+				s.mu.RLock()
+				p := s.pendingReq[frame.ReqID]
+				s.mu.RUnlock()
+				if p != nil {
+					select {
+					case p.ch <- frame:
+					default:
+					}
+				}
+			}
+		}
+	}
+}
+
+func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
+	streamID := strings.TrimSpace(r.URL.Query().Get("stream_id"))
+	if streamID == "" {
+		http.Error(w, "missing stream_id", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	ch := s.streams[streamID]
+	s.mu.RUnlock()
+	if ch == nil {
+		http.Error(w, "unknown or expired stream_id", http.StatusNotFound)
+		return
+	}
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	conn, rw, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: ssh-fleet-stream\r\nConnection: Upgrade\r\n\r\n")
+	if err := rw.Flush(); err != nil {
+		_ = conn.Close()
+		return
+	}
+
+	wrapped := wrapHijackedConn(conn, rw)
+	select {
+	case ch <- wrapped:
+	default:
+		_ = wrapped.Close()
+	}
+}
+
+func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
+	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
+	if nodeID == "" {
+		http.Error(w, "missing node_id", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	agent := s.agents[nodeID]
+	s.mu.RUnlock()
+	if agent == nil {
+		http.Error(w, "node is offline", http.StatusServiceUnavailable)
+		return
+	}
+
+	streamID := newRandomID(12)
+	streamCh := make(chan net.Conn, 1)
+
+	s.mu.Lock()
+	s.streams[streamID] = streamCh
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.streams, streamID)
+		s.mu.Unlock()
+	}()
+
+	if err := agent.send(protocol.ControlFrame{
+		Type:     "open-ssh-stream",
+		StreamID: streamID,
+	}); err != nil {
+		http.Error(w, "failed to reach agent", http.StatusBadGateway)
+		return
+	}
+
+	var agentConn net.Conn
+	select {
+	case agentConn = <-streamCh:
+	case <-time.After(10 * time.Second):
+		http.Error(w, "agent stream timeout", http.StatusGatewayTimeout)
+		return
+	case <-r.Context().Done():
+		return
+	}
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		_ = agentConn.Close()
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, rw, err := hj.Hijack()
+	if err != nil {
+		_ = agentConn.Close()
+		return
+	}
+	_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: ssh-fleet-proxy\r\nConnection: Upgrade\r\n\r\n")
+	if err := rw.Flush(); err != nil {
+		_ = clientConn.Close()
+		_ = agentConn.Close()
+		return
+	}
+
+	wrappedClient := wrapHijackedConn(clientConn, rw)
+	spliceConns(wrappedClient, agentConn)
+}
+
+func spliceConns(a, b net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(a, b)
+		if tc, ok := a.(interface{ CloseWrite() error }); ok {
+			_ = tc.CloseWrite()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(b, a)
+		if tc, ok := b.(interface{ CloseWrite() error }); ok {
+			_ = tc.CloseWrite()
+		}
+	}()
+	wg.Wait()
+	_ = a.Close()
+	_ = b.Close()
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func newRandomID(nBytes int) string {
+	b := make([]byte, nBytes)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}

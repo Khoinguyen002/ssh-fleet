@@ -1,0 +1,4 @@
+/sf
+/dist/
+*.log
+.DS_Store
