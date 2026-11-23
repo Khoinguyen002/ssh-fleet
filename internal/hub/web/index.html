@@ -191,6 +191,7 @@
     <div class="brand">
       <span>⚡ SSH Fleet</span>
       <span id="authBadge" class="badge">Checking auth...</span>
+      <span id="relayBadge" class="badge" style="display:none;">WoL Relays: 0</span>
     </div>
     <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
       <button id="connectBtn" class="primary" onclick="toggleConnectPanel()" style="display:none;">➕ Connect Device</button>
@@ -382,6 +383,12 @@
           const info = await infoRes.json();
           realHubToken = info.hub_token || '';
           redactedHubToken = info.hub_token_redacted || 'sf_••••';
+          const onlinePeers = hubNodes.filter(n => n.online && !n.is_vps).length;
+          const totalRelays = (info.esp32_relays_online || 0) + onlinePeers;
+          const rb = document.getElementById('relayBadge');
+          rb.style.display = 'inline-block';
+          rb.textContent = `WoL Relays: ${totalRelays}` + (info.esp32_relays_online ? ` (${info.esp32_relays_online} ESP32)` : '');
+          rb.className = totalRelays > 0 ? 'badge ok' : 'badge warn';
           renderConnectScripts();
         }
       } catch (e) {
@@ -517,6 +524,7 @@
             nodeId: h.node_id || (n && n.node_id) || '',
             os: n ? `${n.os}/${n.arch}` : 'ssh-vps',
             online: n ? Boolean(n.online) : true,
+            isVps: n ? Boolean(n.is_vps) : true,
             powerState: n ? n.power_state : (h.via_hub ? 'offline' : 'static'),
             mac: h.mac || (n && n.mac_addrs && n.mac_addrs[0]) || '',
             broadcastIp: h.broadcast_ip || (n && n.broadcast_ip) || '',
@@ -538,6 +546,7 @@
           nodeId: n.node_id,
           os: `${n.os}/${n.arch}`,
           online: Boolean(n.online),
+          isVps: Boolean(n.is_vps),
           powerState: n.power_state || (n.online ? 'active' : 'offline'),
           mac: (n.mac_addrs && n.mac_addrs[0]) || '',
           broadcastIp: n.broadcast_ip || '',
@@ -564,9 +573,10 @@
 
       grid.innerHTML = items.map((t, idx) => {
         const badgeClass = t.kind === 'vps' ? 'badge' : (t.online ? 'badge ok' : 'badge off');
-        const stateText = t.kind === 'vps' ? 'VPS' : (t.online ? `ON · ${t.powerState}` : `OFF · ${t.powerState}`);
+        const stateText = t.kind === 'vps' ? 'VPS' : (t.isVps ? (t.online ? '☁️ VPS · ON' : '☁️ VPS · OFF') : (t.online ? `ON · ${t.powerState}` : `OFF · ${t.powerState}`));
         const sub = [t.user ? `${t.user}@${t.host}` : t.host, t.os, t.mac].filter(Boolean).join(' · ');
         const isKeepAwake = t.powerState === 'keep-awake';
+        const allowPowerCtrl = t.kind === 'hub-device' && !t.isVps;
 
         return `
           <div class="card">
@@ -580,10 +590,10 @@
             <div class="actions">
               ${t.kind === 'hub-device' && t.online ? `<button class="primary" onclick="openAgentTerminal('${escAttr(t.nodeId)}','${escAttr(t.name)}')">>_ Shell</button>` : ''}
               ${(t.kind === 'vps' || t.online) ? `<button onclick="openSSHTerminal(${idx})">SSH</button>` : ''}
-              ${t.kind === 'hub-device' ? `<button class="wake" onclick="sendPower('${escAttr(t.nodeId)}','wake','${escAttr(t.mac)}','${escAttr(t.broadcastIp)}','${escAttr(t.relayNodeId)}')">⚡ Wake</button>` : ''}
-              ${t.kind === 'hub-device' && t.online ? `<button class="sleep" onclick="sendPower('${escAttr(t.nodeId)}','soft-sleep')">🌙 Soft Sleep</button>` : ''}
-              ${t.kind === 'hub-device' && t.online ? `<button onclick="sendPower('${escAttr(t.nodeId)}','${isKeepAwake ? 'keep-awake-off' : 'keep-awake-on'}')">☕ ${isKeepAwake ? 'Awake ON' : 'Keep Awake'}</button>` : ''}
-              ${t.kind === 'hub-device' && t.online ? `<button class="danger" onclick="confirmHardSleep('${escAttr(t.nodeId)}','${escAttr(t.name)}')">💤 Hard Sleep</button>` : ''}
+              ${allowPowerCtrl ? `<button class="wake" onclick="sendPower('${escAttr(t.nodeId)}','wake','${escAttr(t.mac)}','${escAttr(t.broadcastIp)}','${escAttr(t.relayNodeId)}')">⚡ Wake</button>` : ''}
+              ${allowPowerCtrl && t.online ? `<button class="sleep" onclick="sendPower('${escAttr(t.nodeId)}','soft-sleep')">🌙 Soft Sleep</button>` : ''}
+              ${allowPowerCtrl && t.online ? `<button onclick="sendPower('${escAttr(t.nodeId)}','${isKeepAwake ? 'keep-awake-off' : 'keep-awake-on'}')">☕ ${isKeepAwake ? 'Awake ON' : 'Keep Awake'}</button>` : ''}
+              ${allowPowerCtrl && t.online ? `<button class="danger" onclick="confirmHardSleep('${escAttr(t.nodeId)}','${escAttr(t.name)}')">💤 Hard Sleep</button>` : ''}
             </div>
           </div>
         `;

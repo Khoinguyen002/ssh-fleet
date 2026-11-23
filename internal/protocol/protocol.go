@@ -36,6 +36,7 @@ type NodeInfo struct {
 	BroadcastIP string     `json:"broadcast_ip,omitempty"`
 	PowerState  PowerState `json:"power_state"`
 	Online      bool       `json:"online"`
+	IsVPS       bool       `json:"is_vps,omitempty"`
 	ConnectedAt time.Time  `json:"connected_at,omitempty"`
 	LastSeen    time.Time  `json:"last_seen"`
 }

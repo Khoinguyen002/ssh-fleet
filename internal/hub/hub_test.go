@@ -22,6 +22,7 @@ import (
 	"ssh-fleet/internal/power"
 	"ssh-fleet/internal/protocol"
 	"ssh-fleet/internal/wol"
+	"ssh-fleet/internal/ws"
 )
 
 type fakePowerExec struct {
@@ -493,5 +494,127 @@ func TestCloudflareAccessAuthAndWebSocketTerminal(t *testing.T) {
 	}
 	if !strings.Contains(collected.String(), "WS_OK") {
 		t.Fatalf("expected WS_OK in terminal output, got: %q", collected.String())
+	}
+}
+
+func TestVPSSleepProtectionAndESP32WakeRelay(t *testing.T) {
+	tmp := t.TempDir()
+	const token = "vps-esp32-token"
+
+	srv, err := NewServer(token, tmp)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer func() {
+		_ = srv.Close()
+		ts.Close()
+		time.Sleep(60 * time.Millisecond)
+	}()
+
+	// 1. Register a VPS node (IsVPS=true) and verify soft-sleep and hard-sleep are blocked.
+	isVPS := true
+	vpsAgent, err := agent.NewClient(agent.Options{
+		HubURL:       ts.URL,
+		Token:        token,
+		NodeID:       "prod-vps-1",
+		Name:         "prod-vps-1",
+		IsVPS:        &isVPS,
+		PingInterval: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient vpsAgent: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		time.Sleep(40 * time.Millisecond)
+	}()
+	go func() { _ = vpsAgent.Run(ctx) }()
+
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(srv.ListNodes()) == 1 && srv.ListNodes()[0].Online {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	for _, act := range []protocol.PowerAction{protocol.ActionSoftSleep, protocol.ActionHardSleep} {
+		b, _ := json.Marshal(protocol.PowerRequest{Action: act})
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/prod-vps-1/power", bytes.NewReader(b))
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post %s err: %v", act, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected 400 refusing %s on VPS, got %d", act, resp.StatusCode)
+		}
+	}
+
+	// 2. Connect a simulated ESP32 wake relay on /hub/ws/wake and wake an offline PC.
+	espConn, err := ws.DialClient(context.Background(), ts.URL, "/hub/ws/wake", token, nil)
+	if err != nil {
+		t.Fatalf("DialClient /hub/ws/wake: %v", err)
+	}
+	defer espConn.Close()
+
+	_ = espConn.WriteText(`{"t":"hello","firmwareVersion":"1.0.0"}`)
+	_, ackRaw, err := espConn.ReadMessage()
+	if err != nil || !strings.Contains(string(ackRaw), `"hello-ack"`) {
+		t.Fatalf("expected hello-ack from /hub/ws/wake, got %q (err=%v)", ackRaw, err)
+	}
+
+	espWakeReceived := make(chan string, 1)
+	go func() {
+		for {
+			_, raw, err := espConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg struct {
+				T         string `json:"t"`
+				RequestID string `json:"requestId"`
+				MAC       string `json:"mac"`
+			}
+			if json.Unmarshal(raw, &msg) == nil && msg.T == "wake" {
+				espWakeReceived <- msg.MAC
+				resp, _ := json.Marshal(map[string]any{
+					"t":         "wake-ack",
+					"requestId": msg.RequestID,
+					"ok":        true,
+				})
+				_ = espConn.WriteText(string(resp))
+			}
+		}
+	}()
+
+	wakeBody, _ := json.Marshal(protocol.PowerRequest{
+		Action:      protocol.ActionWake,
+		MAC:         "9c:6b:00:13:9e:b3",
+		BroadcastIP: "192.168.1.255",
+	})
+	wakeReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/offline-home-pc/power", bytes.NewReader(wakeBody))
+	wakeReq.Header.Set("Authorization", "Bearer "+token)
+	wakeResp, err := http.DefaultClient.Do(wakeReq)
+	if err != nil {
+		t.Fatalf("wake offline PC err: %v", err)
+	}
+	var wakeOut protocol.PowerResponse
+	_ = json.NewDecoder(wakeResp.Body).Decode(&wakeOut)
+	_ = wakeResp.Body.Close()
+
+	if !wakeOut.OK || wakeOut.Method != "wol-lan-relay" || len(wakeOut.Relays) != 1 || !strings.HasPrefix(wakeOut.Relays[0], "esp32-") {
+		t.Fatalf("expected ESP32 wake relay success, got %+v", wakeOut)
+	}
+	select {
+	case mac := <-espWakeReceived:
+		if mac != "9c:6b:00:13:9e:b3" {
+			t.Fatalf("unexpected MAC on ESP32 wake frame: %s", mac)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("ESP32 did not receive wake command")
 	}
 }

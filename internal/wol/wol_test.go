@@ -62,3 +62,16 @@ func TestSendMagicPacketLoopbackUDP(t *testing.T) {
 		t.Fatalf("received packet mismatch")
 	}
 }
+
+func TestIsVirtualInterfaceName(t *testing.T) {
+	for _, virt := range []string{"docker0", "br-4159b85017e1", "vethaa72bc9", "CloudflareWARP", "tun0", "wg0", "lo"} {
+		if !IsVirtualInterfaceName(virt) {
+			t.Fatalf("expected %q to be classified as virtual interface", virt)
+		}
+	}
+	for _, phys := range []string{"enp3s0", "eth0", "wlan0", "en0"} {
+		if IsVirtualInterfaceName(phys) {
+			t.Fatalf("expected %q not to be classified as virtual interface", phys)
+		}
+	}
+}

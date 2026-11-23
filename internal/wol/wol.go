@@ -4,7 +4,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
+	"time"
 )
 
 type NetInterfaceInfo struct {
@@ -80,15 +85,20 @@ func SendMagicPacket(macAddr, broadcastIP string, ports ...int) error {
 			}
 			continue
 		}
-		_, wErr := conn.Write(pkt[:])
-		_ = conn.Close()
-		if wErr != nil {
-			if firstErr == nil {
-				firstErr = wErr
+		// Send magic packet 3 times with 40ms spacing to guard against UDP drops.
+		for attempt := 0; attempt < 3; attempt++ {
+			if _, wErr := conn.Write(pkt[:]); wErr != nil {
+				if firstErr == nil {
+					firstErr = wErr
+				}
+			} else {
+				sentAny = true
 			}
-			continue
+			if attempt < 2 {
+				time.Sleep(40 * time.Millisecond)
+			}
 		}
-		sentAny = true
+		_ = conn.Close()
 	}
 
 	if !sentAny && firstErr != nil {
@@ -97,16 +107,56 @@ func SendMagicPacket(macAddr, broadcastIP string, ports ...int) error {
 	return nil
 }
 
-// DetectNetworkInterfaces returns active, non-loopback IPv4 interfaces with MAC, subnet CIDR, and broadcast IP.
+// IsVirtualInterfaceName reports whether an interface name belongs to a Docker/VPN/virtual bridge rather than physical NIC.
+func IsVirtualInterfaceName(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	for _, p := range []string{
+		"lo", "docker", "br-", "veth", "virbr", "tun", "tap",
+		"wg", "tailscale", "cloudflare", "vmnet", "vboxnet", "zt", "utun", "awdl",
+	} {
+		if lower == p || strings.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func interfacePriority(name string) int {
+	lower := strings.ToLower(name)
+	for _, p := range []string{"enp", "eth", "eno", "ens", "em"} {
+		if strings.HasPrefix(lower, p) {
+			return 0
+		}
+	}
+	if strings.HasPrefix(lower, "wl") {
+		return 1
+	}
+	return 2
+}
+
+func isPhysicalSysfsNIC(name string) bool {
+	if runtime.GOOS != "linux" {
+		return !IsVirtualInterfaceName(name)
+	}
+	_, err := os.Stat(filepath.Join("/sys/class/net", name, "device"))
+	return err == nil
+}
+
+// DetectNetworkInterfaces returns active, non-virtual IPv4 interfaces prioritized by physical Ethernet NIC first.
 func DetectNetworkInterfaces() ([]NetInterfaceInfo, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
 
-	var out []NetInterfaceInfo
+	var physical []NetInterfaceInfo
+	var fallback []NetInterfaceInfo
+
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if IsVirtualInterfaceName(iface.Name) {
 			continue
 		}
 		if len(iface.HardwareAddr) != 6 {
@@ -116,6 +166,7 @@ func DetectNetworkInterfaces() ([]NetInterfaceInfo, error) {
 		if err != nil {
 			continue
 		}
+		isPhys := isPhysicalSysfsNIC(iface.Name)
 		for _, a := range addrs {
 			ipNet, ok := a.(*net.IPNet)
 			if !ok {
@@ -133,14 +184,31 @@ func DetectNetworkInterfaces() ([]NetInterfaceInfo, error) {
 				bcast[i] = networkIP[i] | ^ipNet.Mask[i]
 			}
 
-			out = append(out, NetInterfaceInfo{
+			item := NetInterfaceInfo{
 				Name:        iface.Name,
 				MAC:         iface.HardwareAddr.String(),
 				IPv4:        ip4.String(),
 				SubnetCIDR:  fmt.Sprintf("%s/%d", networkIP.String(), ones),
 				BroadcastIP: bcast.String(),
-			})
+			}
+			if isPhys {
+				physical = append(physical, item)
+			} else {
+				fallback = append(fallback, item)
+			}
 		}
 	}
+
+	out := physical
+	if len(out) == 0 {
+		out = fallback
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		pi, pj := interfacePriority(out[i].Name), interfacePriority(out[j].Name)
+		if pi != pj {
+			return pi < pj
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out, nil
 }

@@ -33,6 +33,7 @@ type Options struct {
 	Name           string
 	SSHPort        int
 	SSHUser        string
+	IsVPS          *bool
 	Power          *power.Manager
 	WoLHandler     func(mac, broadcastIP string) error
 	NetworkInfoFn  func() ([]wol.NetInterfaceInfo, error)
@@ -43,6 +44,7 @@ type Options struct {
 type Client struct {
 	opts  Options
 	power *power.Manager
+	isVPS bool
 }
 
 func NewClient(opts Options) (*Client, error) {
@@ -97,7 +99,44 @@ func NewClient(opts Options) (*Client, error) {
 	if opts.ReconnectDelay <= 0 {
 		opts.ReconnectDelay = 3 * time.Second
 	}
-	return &Client{opts: opts, power: opts.Power}, nil
+	isVPS := DetectIsVPS()
+	if opts.IsVPS != nil {
+		isVPS = *opts.IsVPS
+	}
+	return &Client{opts: opts, power: opts.Power, isVPS: isVPS}, nil
+}
+
+// DetectIsVPS reports whether the host is running inside a cloud VM / hypervisor / container.
+func DetectIsVPS() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	for _, p := range []string{
+		"/sys/class/dmi/id/sys_vendor",
+		"/sys/class/dmi/id/product_name",
+		"/sys/class/dmi/id/board_vendor",
+		"/sys/hypervisor/type",
+	} {
+		if b, err := os.ReadFile(p); err == nil {
+			val := strings.ToLower(string(b))
+			for _, sig := range []string{
+				"qemu", "kvm", "vmware", "virtualbox", "xen", "bochs",
+				"parallels", "amazon ec2", "google", "digitalocean", "hetzner",
+				"openstack", "linode", "vultr", "microsoft corporation", "virtuozzo",
+			} {
+				if strings.Contains(val, sig) {
+					return true
+				}
+			}
+		}
+	}
+	if out, err := exec.Command("systemd-detect-virt").Output(); err == nil {
+		v := strings.ToLower(strings.TrimSpace(string(out)))
+		if v != "" && v != "none" {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) Run(ctx context.Context) error {
@@ -157,6 +196,7 @@ func (c *Client) buildNodeInfo() protocol.NodeInfo {
 		BroadcastIP: bcast,
 		PowerState:  c.power.State(),
 		Online:      true,
+		IsVPS:       c.isVPS,
 	}
 }
 
@@ -407,6 +447,16 @@ func (c *Client) handlePowerCmd(sendFrame func(protocol.ControlFrame) error, fra
 			Error:      errString(err),
 		})
 	case protocol.ActionSoftSleep:
+		if c.isVPS {
+			_ = sendFrame(protocol.ControlFrame{
+				Type:       "power-ack",
+				ReqID:      frame.ReqID,
+				OK:         false,
+				PowerState: c.power.State(),
+				Error:      "refusing to sleep a VPS / virtual machine",
+			})
+			return
+		}
 		st, err := c.power.SoftSleep()
 		_ = sendFrame(protocol.ControlFrame{
 			Type:       "power-ack",
@@ -425,6 +475,16 @@ func (c *Client) handlePowerCmd(sendFrame func(protocol.ControlFrame) error, fra
 			Error:      errString(err),
 		})
 	case protocol.ActionHardSleep:
+		if c.isVPS {
+			_ = sendFrame(protocol.ControlFrame{
+				Type:       "power-ack",
+				ReqID:      frame.ReqID,
+				OK:         false,
+				PowerState: c.power.State(),
+				Error:      "refusing to hard-sleep a VPS / virtual machine",
+			})
+			return
+		}
 		_ = sendFrame(protocol.ControlFrame{
 			Type:       "power-ack",
 			ReqID:      frame.ReqID,

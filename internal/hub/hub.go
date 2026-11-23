@@ -84,6 +84,25 @@ type Options struct {
 	CFAccessEmail string
 }
 
+type esp32WakeRelay struct {
+	id      string
+	ws      *ws.Conn
+	pending map[string]chan struct {
+		ok  bool
+		err string
+	}
+	mu     sync.Mutex
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (r *esp32WakeRelay) close() {
+	r.once.Do(func() {
+		close(r.closed)
+		_ = r.ws.Close()
+	})
+}
+
 type Server struct {
 	token         string
 	dataDir       string
@@ -92,6 +111,7 @@ type Server struct {
 	mu            sync.RWMutex
 	nodes         map[string]*protocol.NodeInfo
 	agents        map[string]*activeAgent
+	esp32Relays   map[string]*esp32WakeRelay
 	pendingReq    map[string]*pendingAck
 	streams       map[string]chan net.Conn
 	httpSrv       *http.Server
@@ -128,6 +148,7 @@ func NewServerWithOptions(opts Options) (*Server, error) {
 		cfEmails:      emails,
 		nodes:         make(map[string]*protocol.NodeInfo),
 		agents:        make(map[string]*activeAgent),
+		esp32Relays:   make(map[string]*esp32WakeRelay),
 		pendingReq:    make(map[string]*pendingAck),
 		streams:       make(map[string]chan net.Conn),
 	}
@@ -151,6 +172,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/tunnel/control", s.withAuth(s.handleControlTunnel))
 	mux.HandleFunc("/tunnel/agent-stream", s.withAuth(s.handleAgentStream))
 	mux.HandleFunc("/tunnel/client-proxy", s.withAuth(s.handleClientProxy))
+	mux.HandleFunc("/hub/ws/wake", s.withAuth(s.handleESP32WakeTunnel))
 	mux.Handle("/", webHandler())
 	return mux
 }
@@ -168,6 +190,9 @@ func (s *Server) Close() error {
 	s.mu.Lock()
 	for _, a := range s.agents {
 		a.close()
+	}
+	for _, er := range s.esp32Relays {
+		er.close()
 	}
 	s.mu.Unlock()
 	if s.httpSrv != nil {
@@ -276,10 +301,14 @@ func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.mu.RLock()
+	espCount := len(s.esp32Relays)
+	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":                 true,
-		"hub_token":          s.token,
-		"hub_token_redacted": redactToken(s.token),
+		"ok":                  true,
+		"hub_token":           s.token,
+		"hub_token_redacted":  redactToken(s.token),
+		"esp32_relays_online": espCount,
 	})
 }
 
@@ -430,6 +459,15 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 	agent := s.agents[nodeID]
 	s.mu.RUnlock()
 
+	if exists && nodeCopy.IsVPS && (req.Action == protocol.ActionSoftSleep || req.Action == protocol.ActionHardSleep) {
+		writeJSON(w, http.StatusBadRequest, protocol.PowerResponse{
+			OK:     false,
+			NodeID: nodeID,
+			Error:  "refusing to sleep a VPS / virtual machine (would make it unreachable without provider console reboot)",
+		})
+		return
+	}
+
 	if req.Action == protocol.ActionWake {
 		if agent != nil {
 			ack, err := s.sendAndWait(agent, protocol.ControlFrame{
@@ -454,7 +492,7 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Target is offline or sleeping: route Wake-on-LAN Magic Packet via online peer agents on the same LAN.
+		// Target is offline or sleeping: route Wake-on-LAN Magic Packet via online peer agents AND connected ESP32 wake relays.
 		mac := strings.TrimSpace(req.MAC)
 		if mac == "" && exists && len(nodeCopy.MACAddrs) > 0 {
 			mac = nodeCopy.MACAddrs[0]
@@ -473,17 +511,31 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 		}
 
 		relays := s.selectRelayAgents(nodeID, &nodeCopy, req.RelayNodeID)
-		if len(relays) == 0 {
+		s.mu.RLock()
+		espList := make([]*esp32WakeRelay, 0, len(s.esp32Relays))
+		for _, er := range s.esp32Relays {
+			espList = append(espList, er)
+		}
+		s.mu.RUnlock()
+
+		if len(relays) == 0 && len(espList) == 0 {
 			writeJSON(w, http.StatusServiceUnavailable, protocol.PowerResponse{
 				OK:     false,
 				NodeID: nodeID,
-				Error:  "no online relay agent available on LAN to transmit Wake-on-LAN packet",
+				Error:  "no online peer agent or ESP32 wake relay on LAN to transmit Wake-on-LAN packet",
 			})
 			return
 		}
 
 		var succeeded []string
 		var errs []string
+		for _, er := range espList {
+			if err := s.sendESP32Wake(er, mac, bcast, 5*time.Second); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", er.id, err))
+			} else {
+				succeeded = append(succeeded, er.id)
+			}
+		}
 		for _, relay := range relays {
 			ack, err := s.sendAndWait(relay, protocol.ControlFrame{
 				Type:        "wol-cmd",
@@ -573,9 +625,12 @@ func (s *Server) selectRelayAgents(targetID string, targetInfo *protocol.NodeInf
 		if id == targetID {
 			continue
 		}
-		allOnline = append(allOnline, a)
-		if len(targetSubnets) > 0 {
-			if n, ok := s.nodes[id]; ok {
+		if n, ok := s.nodes[id]; ok {
+			if n.IsVPS {
+				// Cloud VPS agents cannot send Layer-2 WoL Magic Packets to a home LAN.
+				continue
+			}
+			if len(targetSubnets) > 0 {
 				for _, cidr := range n.SubnetCIDRs {
 					if targetSubnets[cidr] {
 						sameSubnet = append(sameSubnet, a)
@@ -584,6 +639,7 @@ func (s *Server) selectRelayAgents(targetID string, targetInfo *protocol.NodeInf
 				}
 			}
 		}
+		allOnline = append(allOnline, a)
 	}
 
 	if len(sameSubnet) > 0 {
@@ -1088,6 +1144,117 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 	_ = cmd.Wait()
+}
+
+func (s *Server) handleESP32WakeTunnel(w http.ResponseWriter, r *http.Request) {
+	conn, err := ws.UpgradeServer(w, r)
+	if err != nil {
+		return
+	}
+	relayID := "esp32-" + newRandomID(4)
+	relay := &esp32WakeRelay{
+		id: relayID,
+		ws: conn,
+		pending: make(map[string]chan struct {
+			ok  bool
+			err string
+		}),
+		closed: make(chan struct{}),
+	}
+
+	s.mu.Lock()
+	s.esp32Relays[relayID] = relay
+	s.mu.Unlock()
+
+	defer func() {
+		relay.close()
+		s.mu.Lock()
+		delete(s.esp32Relays, relayID)
+		s.mu.Unlock()
+	}()
+
+	for {
+		_, payload, rErr := conn.ReadMessage()
+		if rErr != nil {
+			return
+		}
+		var msg struct {
+			T               string `json:"t"`
+			FirmwareVersion string `json:"firmwareVersion,omitempty"`
+			RequestID       string `json:"requestId,omitempty"`
+			OK              bool   `json:"ok,omitempty"`
+			Error           string `json:"error,omitempty"`
+		}
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			continue
+		}
+		switch msg.T {
+		case "hello":
+			ack, _ := json.Marshal(map[string]any{"t": "hello-ack", "agentId": relayID})
+			_ = conn.WriteText(string(ack))
+		case "ping":
+			pong, _ := json.Marshal(map[string]any{"t": "pong", "ts": time.Now().UnixMilli()})
+			_ = conn.WriteText(string(pong))
+		case "wake-ack":
+			relay.mu.Lock()
+			ch := relay.pending[msg.RequestID]
+			delete(relay.pending, msg.RequestID)
+			relay.mu.Unlock()
+			if ch != nil {
+				ch <- struct {
+					ok  bool
+					err string
+				}{ok: msg.OK, err: msg.Error}
+			}
+		}
+	}
+}
+
+func (s *Server) sendESP32Wake(relay *esp32WakeRelay, mac, broadcastIP string, timeout time.Duration) error {
+	reqID := newRandomID(8)
+	ch := make(chan struct {
+		ok  bool
+		err string
+	}, 1)
+
+	relay.mu.Lock()
+	relay.pending[reqID] = ch
+	relay.mu.Unlock()
+
+	defer func() {
+		relay.mu.Lock()
+		delete(relay.pending, reqID)
+		relay.mu.Unlock()
+	}()
+
+	payload := map[string]any{
+		"t":         "wake",
+		"requestId": reqID,
+		"mac":       mac,
+		"port":      9,
+	}
+	if broadcastIP != "" {
+		payload["broadcastIp"] = broadcastIP
+	}
+	b, _ := json.Marshal(payload)
+	if err := relay.ws.WriteText(string(b)); err != nil {
+		return err
+	}
+
+	select {
+	case res := <-ch:
+		if !res.ok {
+			if res.err == "" {
+				return errors.New("esp32 wake failed")
+			}
+			return errors.New(res.err)
+		}
+		return nil
+	case <-time.After(timeout):
+		return errors.New("esp32 wake relay timed out")
+	case <-relay.closed:
+		return errors.New("esp32 wake relay disconnected")
+	}
 }
 
 func spliceConns(a, b net.Conn) {
