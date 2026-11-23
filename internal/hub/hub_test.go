@@ -370,12 +370,13 @@ func TestCloudflareAccessAuthAndWebSocketTerminal(t *testing.T) {
 		t.Fatalf("auth status err: %v", err)
 	}
 	var st0 struct {
-		Authenticated bool `json:"authenticated"`
+		Authenticated   bool `json:"authenticated"`
+		CFAccessEnabled bool `json:"cf_access_enabled"`
 	}
 	_ = json.NewDecoder(resp0.Body).Decode(&st0)
 	_ = resp0.Body.Close()
-	if st0.Authenticated {
-		t.Fatalf("expected unauthenticated without header")
+	if st0.Authenticated || st0.CFAccessEnabled {
+		t.Fatalf("expected unauthenticated and cf_access_enabled=false without header, got %+v", st0)
 	}
 
 	// 2. Denied for unlisted CF Access email
@@ -398,13 +399,14 @@ func TestCloudflareAccessAuthAndWebSocketTerminal(t *testing.T) {
 		t.Fatalf("reqAllow err: %v", err)
 	}
 	var stAllow struct {
-		Authenticated bool   `json:"authenticated"`
-		CFEmail       string `json:"cf_email"`
+		Authenticated   bool   `json:"authenticated"`
+		CFAccessEnabled bool   `json:"cf_access_enabled"`
+		CFEmail         string `json:"cf_email"`
 	}
 	_ = json.NewDecoder(respAllow.Body).Decode(&stAllow)
 	_ = respAllow.Body.Close()
-	if !stAllow.Authenticated || stAllow.CFEmail != "khoi@example.com" {
-		t.Fatalf("expected CF Access authenticated as khoi@example.com, got %+v", stAllow)
+	if !stAllow.Authenticated || !stAllow.CFAccessEnabled || stAllow.CFEmail != "khoi@example.com" {
+		t.Fatalf("expected CF Access authenticated with cf_access_enabled=true as khoi@example.com, got %+v", stAllow)
 	}
 
 	// 3b. Verify /api/v1/hub-info rejects unauthenticated and returns redacted + full token when authenticated
@@ -488,6 +490,17 @@ func TestCloudflareAccessAuthAndWebSocketTerminal(t *testing.T) {
 	_ = webResp.Body.Close()
 	if !strings.Contains(string(webBytes), "SSH Fleet") {
 		t.Fatalf("unexpected Web UI HTML")
+	}
+	for _, assetPath := range []string{"/favicon.svg", "/favicon.ico", "/apple-touch-icon.png", "/icon-192.png", "/icon-512.png", "/manifest.json"} {
+		aResp, aErr := http.Get(ts.URL + assetPath)
+		if aErr != nil || aResp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s failed: err=%v resp=%v", assetPath, aErr, aResp)
+		}
+		aBytes, _ := io.ReadAll(aResp.Body)
+		_ = aResp.Body.Close()
+		if len(aBytes) == 0 {
+			t.Fatalf("expected non-empty body for %s", assetPath)
+		}
 	}
 
 	// 5. Connect an agent and test WebSocket interactive agent shell stream via CF Access header

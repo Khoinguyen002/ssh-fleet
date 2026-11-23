@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#0a0a0b" />
   <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="icon" type="image/x-icon" sizes="32x32 16x16" href="/favicon.ico" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
   <title>SSH Fleet</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
   <style>
@@ -863,12 +866,9 @@
           <button id="tabUnix" type="button" class="cx-btn-tab is-active" onclick="setJoinOS('unix')">Linux / macOS</button>
           <button id="tabWin" type="button" class="cx-btn-tab" onclick="setJoinOS('win')">Windows</button>
         </div>
-        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--cx-label-2);cursor:pointer;">
-          <input id="joinIncludeCF" type="checkbox" onchange="renderConnectPreview()" style="accent-color:var(--cx-blue);" />
-          <span>Include Cloudflare Access flags</span>
-        </label>
       </div>
       <div id="joinPreviewBox" class="code-box"></div>
+      <div id="connectCFNote" style="display:none;font-size:12px;color:var(--cx-orange);">Cloudflare Access enabled — replace &lt;CF_CLIENT_ID&gt; and &lt;CF_CLIENT_SECRET&gt; with your Service Token before running.</div>
       <div class="inline-row">
         <span style="font-size:12px;color:var(--cx-label-3);">Token is minted only when you click Generate &amp; Copy.</span>
         <button id="mintCopyBtn" type="button" class="cx-btn" onclick="mintAndCopyJoinScript()">Generate &amp; Copy Command</button>
@@ -972,6 +972,7 @@
     }
 
     let isAuthed = false;
+    let hubCFAccessEnabled = false;
     let hubVersion = '';
     let hubNodes = [];
     let wakeRelays = [];
@@ -1072,14 +1073,17 @@
         const data = await parseApiResponse(res);
         const badge = document.getElementById('authBadge');
         if (data.authenticated) {
+          hubCFAccessEnabled = Boolean(data.cf_access_enabled);
           document.getElementById('loginBanner').style.display = 'none';
           badge.textContent = data.cf_email ? `· ${data.cf_email}` : '· Authenticated';
           return true;
         }
+        hubCFAccessEnabled = false;
         document.getElementById('loginBanner').style.display = 'flex';
         badge.textContent = '· Locked';
         return false;
       } catch (e) {
+        hubCFAccessEnabled = false;
         showToast('Auth check failed: ' + e.message);
         return false;
       }
@@ -1212,8 +1216,9 @@
     }
 
     function renderConnectPreview() {
-      const includeCF = document.getElementById('joinIncludeCF').checked;
-      document.getElementById('joinPreviewBox').textContent = buildJoinScript(joinOS, '<one-time-join-token>', includeCF);
+      document.getElementById('joinPreviewBox').textContent = buildJoinScript(joinOS, '<one-time-join-token>', hubCFAccessEnabled);
+      const cfNote = document.getElementById('connectCFNote');
+      if (cfNote) cfNote.style.display = hubCFAccessEnabled ? 'block' : 'none';
     }
 
     function toggleConnectPanel(force) {
@@ -1252,12 +1257,11 @@
         if (!res.ok || !data.ok || !data.join_token) {
           throw new Error(data.error || 'failed to mint one-time join token');
         }
-        const includeCF = document.getElementById('joinIncludeCF').checked;
-        lastMintedJoinCmd = buildJoinScript(joinOS, data.join_token, includeCF);
+        lastMintedJoinCmd = buildJoinScript(joinOS, data.join_token, hubCFAccessEnabled);
         document.getElementById('joinMintedCmd').textContent = lastMintedJoinCmd;
         document.getElementById('joinMintedCard').style.display = 'flex';
         await copyText(lastMintedJoinCmd);
-        showToast('Minted 5m join token and copied command');
+        showToast(hubCFAccessEnabled ? 'Minted 5m join token — replace CF Service Token placeholders before running' : 'Minted 5m join token and copied command');
       } catch (e) {
         setGlobalError('Connect command error: ' + e.message);
         showToast('Connect command error: ' + e.message);

@@ -381,9 +381,10 @@ func (s *Server) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	role, cfEmail := s.authenticateRequest(r)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":            true,
-		"authenticated": role == authAdmin,
-		"cf_email":      cfEmail,
+		"ok":                true,
+		"authenticated":     role == authAdmin,
+		"cf_access_enabled": role == authAdmin && s.trustCFAccess,
+		"cf_email":          cfEmail,
 	})
 }
 

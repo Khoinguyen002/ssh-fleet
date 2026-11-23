@@ -1552,6 +1552,9 @@ func cmdJoin(args []string) error {
 	if *sshPortFlag > 0 {
 		cfg.SSHPort = *sshPortFlag
 	}
+	if strings.HasPrefix(strings.TrimSpace(*cfIDFlag), "<") || strings.HasPrefix(strings.TrimSpace(*cfSecretFlag), "<") {
+		return errors.New("replace <CF_CLIENT_ID> and <CF_CLIENT_SECRET> with your actual Cloudflare Access Service Token")
+	}
 	if *cfIDFlag != "" {
 		cfg.CFClientID = *cfIDFlag
 	}
