@@ -4,11 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2120,5 +2126,566 @@ func TestRemoteSelfUpdateAndTerminalColorEnv(t *testing.T) {
 	}
 	if !strings.Contains(gotOut, "30 100") {
 		t.Fatalf("expected terminal output to contain initial stty size '30 100', got:\n%s", gotOut)
+	}
+}
+
+func signTestRS256JWT(t *testing.T, priv *rsa.PrivateKey, kid string, claims map[string]any) string {
+	t.Helper()
+	hdrJSON, _ := json.Marshal(map[string]string{
+		"alg": "RS256",
+		"typ": "JWT",
+		"kid": kid,
+	})
+	claimsJSON, _ := json.Marshal(claims)
+	signingInput := base64.RawURLEncoding.EncodeToString(hdrJSON) + "." + base64.RawURLEncoding.EncodeToString(claimsJSON)
+	digest := sha256.Sum256([]byte(signingInput))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, digest[:])
+	if err != nil {
+		t.Fatalf("SignPKCS1v15 err: %v", err)
+	}
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+func TestCloudflareAccessRS256JWTVerification(t *testing.T) {
+	if _, err := NewServerWithOptions(Options{
+		Token:              "admin-tok",
+		DataDir:            t.TempDir(),
+		CFAccessTeamDomain: "myteam.cloudflareaccess.com",
+	}); err == nil {
+		t.Fatalf("expected error for partial CF Access config without CFAccessAUD")
+	}
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("GenerateKey err: %v", err)
+	}
+	const kid = "cf-test-key-1"
+	eBig := big.NewInt(int64(priv.PublicKey.E))
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"keys": []map[string]string{{
+				"kty": "RSA",
+				"kid": kid,
+				"n":   base64.RawURLEncoding.EncodeToString(priv.PublicKey.N.Bytes()),
+				"e":   base64.RawURLEncoding.EncodeToString(eBig.Bytes()),
+			}},
+		})
+	}))
+	defer jwksSrv.Close()
+
+	srv, err := NewServerWithOptions(Options{
+		Token:              "admin-tok",
+		DataDir:            t.TempDir(),
+		CFAccessEmail:      "alice@example.com",
+		CFAccessTeamDomain: "myteam.cloudflareaccess.com",
+		CFAccessAUD:        "aud-tag-xyz",
+		CFAccessJWKSURL:    jwksSrv.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewServerWithOptions err: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer func() {
+		_ = srv.Close()
+		ts.Close()
+	}()
+
+	now := time.Now().Unix()
+	validJWT := signTestRS256JWT(t, priv, kid, map[string]any{
+		"iss":   "https://myteam.cloudflareaccess.com",
+		"aud":   "aud-tag-xyz",
+		"email": "Alice@Example.com",
+		"exp":   now + 300,
+	})
+
+	// 1. Valid JWT via header -> 200.
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/nodes", nil)
+	req.Header.Set("Cf-Access-Jwt-Assertion", validJWT)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with valid CF JWT header, got err=%v status=%v", err, resp)
+	}
+	_ = resp.Body.Close()
+
+	// 2. Valid JWT via CF_Authorization cookie -> 200.
+	reqCookie, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/nodes", nil)
+	reqCookie.AddCookie(&http.Cookie{Name: "CF_Authorization", Value: validJWT})
+	respCookie, err := http.DefaultClient.Do(reqCookie)
+	if err != nil || respCookie.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with valid CF_Authorization cookie, got err=%v status=%v", err, respCookie)
+	}
+	_ = respCookie.Body.Close()
+
+	// 3. Raw email header without JWT when verifier configured -> 401.
+	reqSpoof, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/nodes", nil)
+	reqSpoof.Header.Set("Cf-Access-Authenticated-User-Email", "alice@example.com")
+	respSpoof, _ := http.DefaultClient.Do(reqSpoof)
+	_ = respSpoof.Body.Close()
+	if respSpoof.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when raw CF email header used without JWT, got %d", respSpoof.StatusCode)
+	}
+
+	// 4. Wrong AUD, expired, tampered sig, disallowed email -> all 401.
+	badTokens := []string{
+		signTestRS256JWT(t, priv, kid, map[string]any{
+			"iss":   "https://myteam.cloudflareaccess.com",
+			"aud":   "wrong-aud",
+			"email": "alice@example.com",
+			"exp":   now + 300,
+		}),
+		signTestRS256JWT(t, priv, kid, map[string]any{
+			"iss":   "https://myteam.cloudflareaccess.com",
+			"aud":   "aud-tag-xyz",
+			"email": "alice@example.com",
+			"exp":   now - 600,
+		}),
+		signTestRS256JWT(t, priv, kid, map[string]any{
+			"iss":   "https://myteam.cloudflareaccess.com",
+			"aud":   "aud-tag-xyz",
+			"email": "bob@example.com",
+			"exp":   now + 300,
+		}),
+		validJWT[:len(validJWT)-4] + "AAAA",
+	}
+	for i, bad := range badTokens {
+		r, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/nodes", nil)
+		r.Header.Set("Cf-Access-Jwt-Assertion", bad)
+		res, _ := http.DefaultClient.Do(r)
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("bad JWT case %d expected 401, got %d", i, res.StatusCode)
+		}
+	}
+
+	// 5. Legacy header-only mode enforces loopback RemoteAddr check.
+	hdrSrv, err := NewServerWithOptions(Options{
+		Token:         "admin-tok",
+		DataDir:       t.TempDir(),
+		TrustCFAccess: true,
+		CFAccessEmail: "alice@example.com",
+	})
+	if err != nil {
+		t.Fatalf("NewServerWithOptions header-only err: %v", err)
+	}
+	defer func() { _ = hdrSrv.Close() }()
+
+	h := hdrSrv.Handler()
+	loopReq := httptest.NewRequest(http.MethodGet, "/api/v1/nodes", nil)
+	loopReq.RemoteAddr = "127.0.0.1:12345"
+	loopReq.Header.Set("Cf-Access-Authenticated-User-Email", "alice@example.com")
+	loopRec := httptest.NewRecorder()
+	h.ServeHTTP(loopRec, loopReq)
+	if loopRec.Code != http.StatusOK {
+		t.Fatalf("expected loopback CF header-only request to return 200, got %d", loopRec.Code)
+	}
+
+	extReq := httptest.NewRequest(http.MethodGet, "/api/v1/nodes", nil)
+	extReq.RemoteAddr = "203.0.113.5:12345"
+	extReq.Header.Set("Cf-Access-Authenticated-User-Email", "alice@example.com")
+	extRec := httptest.NewRecorder()
+	h.ServeHTTP(extRec, extReq)
+	if extRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected non-loopback CF header-only request to return 401, got %d", extRec.Code)
+	}
+}
+
+func TestPeerPowerControlAndStreamIsolationAndFailFast(t *testing.T) {
+	const adminTok = "peer-admin-tok"
+	srv, err := NewServer(adminTok, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewServer err: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer func() {
+		_ = srv.Close()
+		ts.Close()
+	}()
+
+	enrollNode := func(nodeID string) string {
+		jt, _ := srv.joinTokens.Create(5 * time.Minute)
+		body, _ := json.Marshal(map[string]string{"join_token": jt, "node_id": nodeID})
+		resp, err := http.Post(ts.URL+"/api/v1/join/exchange", "application/json", bytes.NewReader(body))
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("exchange %s failed: err=%v resp=%v", nodeID, err, resp)
+		}
+		var out struct {
+			NodeToken string `json:"node_token"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		_ = resp.Body.Close()
+		return out.NodeToken
+	}
+
+	tokA := enrollNode("peer-a")
+	tokB := enrollNode("peer-b")
+
+	// Allocate and immediately close a local port to simulate dead local sshd on peer-b.
+	deadLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen err: %v", err)
+	}
+	deadPort := deadLn.Addr().(*net.TCPAddr).Port
+	_ = deadLn.Close()
+
+	fakeExec := &fakePowerExec{}
+	notVPS := false
+	agB, err := agent.NewClient(agent.Options{
+		HubURL:       ts.URL,
+		Token:        tokB,
+		NodeID:       "peer-b",
+		Name:         "Peer B",
+		SSHPort:      deadPort,
+		IsVPS:        &notVPS,
+		Power:        power.NewManager(fakeExec),
+		PingInterval: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient peer-b err: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	agDone := make(chan error, 1)
+	go func() { agDone <- agB.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-agDone:
+		case <-time.After(2 * time.Second):
+		}
+		waitForNodeOnline(t, srv, "peer-b", false, 2*time.Second)
+	}()
+	waitForNodeOnline(t, srv, "peer-b", true, 3*time.Second)
+
+	// 1. Peer-trust model preserved: peer-a can call power (without keyring_password) on peer-b.
+	pwrReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/peer-b/power", strings.NewReader(`{"action":"soft-sleep"}`))
+	pwrReq.Header.Set("Authorization", "Bearer "+tokA)
+	pwrReq.Header.Set("Content-Type", "application/json")
+	pwrResp, err := http.DefaultClient.Do(pwrReq)
+	if err != nil {
+		t.Fatalf("peer power req err: %v", err)
+	}
+	_ = pwrResp.Body.Close()
+	if pwrResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected peer-a power call to return 200, got %d", pwrResp.StatusCode)
+	}
+	fakeExec.mu.Lock()
+	slept := fakeExec.softSlept
+	fakeExec.mu.Unlock()
+	if !slept {
+		t.Fatalf("expected peer-b SoftSleep to be invoked")
+	}
+
+	// 2. Peer-a cannot pass KeyringPassword on /power -> 403.
+	krReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/peer-b/power", strings.NewReader(`{"action":"wake","keyring_password":"secret"}`))
+	krReq.Header.Set("Authorization", "Bearer "+tokA)
+	krReq.Header.Set("Content-Type", "application/json")
+	krResp, _ := http.DefaultClient.Do(krReq)
+	_ = krResp.Body.Close()
+	if krResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for peer-a sending keyring_password, got %d", krResp.StatusCode)
+	}
+
+	// 3. Peer-a cannot attach to peer-b's pending stream on /tunnel/agent-stream -> 403.
+	ps := srv.registerPendingStream("sid-peer-b-isolated", "peer-b")
+	defer srv.cleanupPendingStream("sid-peer-b-isolated", ps)
+	hijackReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/tunnel/agent-stream?stream_id=sid-peer-b-isolated", nil)
+	hijackReq.Header.Set("Authorization", "Bearer "+tokA)
+	hijackResp, err := http.DefaultClient.Do(hijackReq)
+	if err != nil {
+		t.Fatalf("hijack stream req err: %v", err)
+	}
+	_ = hijackResp.Body.Close()
+	if hijackResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 when peer-a claims peer-b stream, got %d", hijackResp.StatusCode)
+	}
+
+	// 4. Client proxy to peer-b with closed local SSHPort fails fast (<2s) with 502 stream-error.
+	start := time.Now()
+	pxReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/tunnel/client-proxy?node_id=peer-b", nil)
+	pxReq.Header.Set("Authorization", "Bearer "+tokA)
+	pxResp, err := http.DefaultClient.Do(pxReq)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("client-proxy req err: %v", err)
+	}
+	_ = pxResp.Body.Close()
+	if pxResp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 fail-fast on unreachable agent SSHPort, got %d", pxResp.StatusCode)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("expected fail-fast < 2s, took %v", elapsed)
+	}
+}
+
+func TestNodeIDValidationOnlineCollisionAndVaultGuard(t *testing.T) {
+	const adminTok = "val-admin-tok"
+	dataDir := t.TempDir()
+	srv, err := NewServer(adminTok, dataDir)
+	if err != nil {
+		t.Fatalf("NewServer err: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer func() {
+		_ = srv.Close()
+		ts.Close()
+	}()
+
+	// 1. Invalid node_id (with dot) returns 400 and does NOT consume the one-time join token.
+	jt1, _ := srv.joinTokens.Create(5 * time.Minute)
+	badBody, _ := json.Marshal(map[string]string{"join_token": jt1, "node_id": "bad.node"})
+	badResp, _ := http.Post(ts.URL+"/api/v1/join/exchange", "application/json", bytes.NewReader(badBody))
+	_ = badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid node_id 'bad.node', got %d", badResp.StatusCode)
+	}
+
+	goodBody, _ := json.Marshal(map[string]string{"join_token": jt1, "node_id": "good-node"})
+	goodResp, _ := http.Post(ts.URL+"/api/v1/join/exchange", "application/json", bytes.NewReader(goodBody))
+	_ = goodResp.Body.Close()
+	if goodResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected same join token to remain valid after 400 rejection, got %d", goodResp.StatusCode)
+	}
+
+	// 2. Online node collision returns 409 and does NOT consume the join token.
+	ag, err := agent.NewClient(agent.Options{
+		HubURL:       ts.URL,
+		Token:        adminTok,
+		NodeID:       "online-node",
+		Name:         "Online Node",
+		PingInterval: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient err: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	agDone := make(chan error, 1)
+	go func() { agDone <- ag.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-agDone:
+		case <-time.After(2 * time.Second):
+		}
+		waitForNodeOnline(t, srv, "online-node", false, 2*time.Second)
+	}()
+	waitForNodeOnline(t, srv, "online-node", true, 3*time.Second)
+
+	jt2, _ := srv.joinTokens.Create(5 * time.Minute)
+	colBody, _ := json.Marshal(map[string]string{"join_token": jt2, "node_id": "online-node"})
+	colResp, _ := http.Post(ts.URL+"/api/v1/join/exchange", "application/json", bytes.NewReader(colBody))
+	_ = colResp.Body.Close()
+	if colResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for online node_id, got %d", colResp.StatusCode)
+	}
+
+	okAfterCol, _ := json.Marshal(map[string]string{"join_token": jt2, "node_id": "other-node"})
+	okResp, _ := http.Post(ts.URL+"/api/v1/join/exchange", "application/json", bytes.NewReader(okAfterCol))
+	_ = okResp.Body.Close()
+	if okResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected join token to remain unconsumed after 409 Conflict, got %d", okResp.StatusCode)
+	}
+
+	// 3. Vault PUT envelope validation & backup creation.
+	putVault := func(payload string) int {
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/vault", strings.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+adminTok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("PUT /api/v1/vault err: %v", err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := putVault(`{not-json`); code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on malformed JSON vault PUT, got %d", code)
+	}
+	if code := putVault(`{"magic":"NOPE","ciphertext":"abc"}`); code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on wrong magic vault PUT, got %d", code)
+	}
+	if code := putVault(`{"magic":"SFV1","ciphertext":""}`); code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty ciphertext vault PUT, got %d", code)
+	}
+	if code := putVault(`{"magic":"SFV1","ciphertext":"first-cipher"}`); code != http.StatusOK {
+		t.Fatalf("expected 200 on first valid vault PUT, got %d", code)
+	}
+	if code := putVault(`{"magic":"SFV1","ciphertext":"second-cipher"}`); code != http.StatusOK {
+		t.Fatalf("expected 200 on second valid vault PUT, got %d", code)
+	}
+
+	bakBytes, err := os.ReadFile(filepath.Join(dataDir, "vault.enc.bak"))
+	if err != nil || !bytes.Contains(bakBytes, []byte("first-cipher")) {
+		t.Fatalf("expected vault.enc.bak to hold first-cipher, err=%v got=%s", err, string(bakBytes))
+	}
+
+	getReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/vault", nil)
+	getReq.Header.Set("Authorization", "Bearer "+adminTok)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/v1/vault failed: err=%v resp=%v", err, getResp)
+	}
+	getBytes, _ := io.ReadAll(getResp.Body)
+	_ = getResp.Body.Close()
+	if !bytes.Contains(getBytes, []byte("second-cipher")) {
+		t.Fatalf("expected GET /api/v1/vault to return second-cipher, got %s", string(getBytes))
+	}
+}
+
+func TestWSOriginGuardAndAuthRateLimit(t *testing.T) {
+	const adminTok = "ws-guard-admin-tok"
+	srv, err := NewServer(adminTok, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewServer err: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer func() {
+		_ = srv.Close()
+		ts.Close()
+	}()
+
+	u, _ := url.Parse(ts.URL)
+	dialUpgradeWithOrigin := func(origin string) string {
+		conn, err := net.DialTimeout("tcp", u.Host, 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial err: %v", err)
+		}
+		defer conn.Close()
+		req := fmt.Sprintf(
+			"GET /api/v1/ws/terminal?mode=agent&node_id=nonexistent HTTP/1.1\r\n"+
+				"Host: %s\r\n"+
+				"Authorization: Bearer %s\r\n"+
+				"Origin: %s\r\n"+
+				"Connection: Upgrade\r\n"+
+				"Upgrade: websocket\r\n"+
+				"Sec-WebSocket-Version: 13\r\n"+
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+			u.Host, adminTok, origin,
+		)
+		_, _ = io.WriteString(conn, req)
+		statusLine, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			t.Fatalf("read status err: %v", err)
+		}
+		return statusLine
+	}
+
+	if st := dialUpgradeWithOrigin("https://evil.example"); !strings.Contains(st, "403") {
+		t.Fatalf("expected 403 for cross-origin WS upgrade, got %q", st)
+	}
+	if st := dialUpgradeWithOrigin("http://" + u.Host); !strings.Contains(st, "101") {
+		t.Fatalf("expected 101 for same-host WS upgrade, got %q", st)
+	}
+
+	// Query ?token= must no longer authenticate requests.
+	qResp, err := http.Get(ts.URL + "/api/v1/nodes?token=" + url.QueryEscape(adminTok))
+	if err != nil {
+		t.Fatalf("query token GET err: %v", err)
+	}
+	_ = qResp.Body.Close()
+	if qResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when passing ?token= query parameter, got %d", qResp.StatusCode)
+	}
+
+	// Rate-limit /api/v1/auth/login after 10 attempts from same IP.
+	for i := 0; i < 10; i++ {
+		r, _ := http.Post(ts.URL+"/api/v1/auth/login", "application/json", strings.NewReader(`{"token":"wrong"}`))
+		_ = r.Body.Close()
+		if r.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("login attempt %d expected 401, got %d", i+1, r.StatusCode)
+		}
+	}
+	r11, _ := http.Post(ts.URL+"/api/v1/auth/login", "application/json", strings.NewReader(`{"token":"wrong"}`))
+	_ = r11.Body.Close()
+	if r11.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("login attempt 11 expected 429 Too Many Requests, got %d", r11.StatusCode)
+	}
+}
+
+func TestShellStreamClosesCleanlyOnWSDisconnect(t *testing.T) {
+	const adminTok = "shell-close-admin-tok"
+	srv, err := NewServer(adminTok, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewServer err: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer func() {
+		_ = srv.Close()
+		ts.Close()
+	}()
+
+	fakeExec := &fakePowerExec{}
+	notVPS := false
+	ag, err := agent.NewClient(agent.Options{
+		HubURL:       ts.URL,
+		Token:        adminTok,
+		NodeID:       "shell-close-node",
+		Name:         "Shell Close Node",
+		IsVPS:        &notVPS,
+		Power:        power.NewManager(fakeExec),
+		PingInterval: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient err: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- ag.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-doneCh:
+		case <-time.After(3 * time.Second):
+		}
+	}()
+	waitForNodeOnline(t, srv, "shell-close-node", true, 3*time.Second)
+
+	wsCtx, wsCancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer wsCancel()
+	wsc, err := ws.DialClient(wsCtx, ts.URL, "/api/v1/ws/terminal?mode=agent&node_id=shell-close-node", adminTok, nil)
+	if err != nil {
+		t.Fatalf("DialClient err: %v", err)
+	}
+
+	if err := wsc.WriteText("echo shell-ok\n"); err != nil {
+		t.Fatalf("WriteText err: %v", err)
+	}
+
+	var out strings.Builder
+	_ = wsc.SetReadDeadline(time.Now().Add(4 * time.Second))
+	for {
+		op, payload, err := wsc.ReadMessage()
+		if err != nil {
+			t.Fatalf("ReadMessage before shell-ok err: %v (output=%q)", err, out.String())
+		}
+		if op == 0x1 || op == 0x2 {
+			out.Write(payload)
+			if strings.Contains(out.String(), "shell-ok") {
+				break
+			}
+		}
+	}
+
+	// Abruptly close client WebSocket while interactive shell is still open.
+	_ = wsc.Close()
+	time.Sleep(450 * time.Millisecond)
+
+	// Control tunnel must remain online and responsive.
+	pwrReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/shell-close-node/power", strings.NewReader(`{"action":"soft-sleep"}`))
+	pwrReq.Header.Set("Authorization", "Bearer "+adminTok)
+	pwrReq.Header.Set("Content-Type", "application/json")
+	pwrResp, err := http.DefaultClient.Do(pwrReq)
+	if err != nil {
+		t.Fatalf("post-disconnect power req err: %v", err)
+	}
+	_ = pwrResp.Body.Close()
+	if pwrResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected agent control tunnel healthy after shell WS close (200), got %d", pwrResp.StatusCode)
+	}
+
+	cancel()
+	select {
+	case <-doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("agent did not exit promptly after context cancel")
 	}
 }

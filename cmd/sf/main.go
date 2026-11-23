@@ -11,7 +11,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -655,6 +657,7 @@ func cmdWake(args []string) error {
 	if target.NodeID != "" && cfg.HubURL != "" {
 		var keyringPw string
 		if *unlockKeyring {
+			warnIfInsecureHubURL(cfg.HubURL, "sending GNOME keyring password")
 			keyringPw, err = getKeyringPassword()
 			if err != nil {
 				return err
@@ -681,6 +684,21 @@ func cmdWake(args []string) error {
 	return errors.New("cannot wake target: neither Hub node nor MAC address configured")
 }
 
+func warnIfInsecureHubURL(hubURL, action string) {
+	u, err := url.Parse(strings.TrimSpace(hubURL))
+	if err != nil || !strings.EqualFold(u.Scheme, "http") {
+		return
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "" || host == "localhost" {
+		return
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: hub URL %q uses unencrypted HTTP (%s); prefer HTTPS or localhost tunnel\n", hubURL, action)
+}
+
 func cmdUnlockKeyring(args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: sf unlock-keyring <target>")
@@ -700,6 +718,7 @@ func cmdUnlockKeyring(args []string) error {
 	if cfg.HubURL == "" || cfg.HubToken == "" {
 		return errors.New("hub_url and hub_token must be configured via `sf config set`")
 	}
+	warnIfInsecureHubURL(cfg.HubURL, "sending GNOME keyring password")
 	nodeID := target.NodeID
 	if nodeID == "" {
 		nodeID = target.Name
@@ -1203,9 +1222,25 @@ func cmdHub(args []string) error {
 	publicURL := fs.String("public-url", "", "Public URL of this Hub for join command output")
 	trustCF := fs.Bool("trust-cf-access", false, "Trust Cloudflare Access Zero Trust authenticated headers for Web UI & API")
 	cfEmail := fs.String("cf-access-email", os.Getenv("SF_CF_ACCESS_EMAIL"), "Comma-separated Cloudflare Access emails allowed (implies --trust-cf-access)")
+	cfTeam := fs.String("cf-access-team", os.Getenv("SF_CF_ACCESS_TEAM"), "Cloudflare Access team domain for RS256 JWT verification (e.g. myteam.cloudflareaccess.com)")
+	cfAud := fs.String("cf-access-aud", os.Getenv("SF_CF_ACCESS_AUD"), "Comma-separated Cloudflare Access Application Audience (AUD) tags")
 	autoUpdate := fs.Bool("auto-update", os.Getenv("SF_AUTO_UPDATE") != "0", "Automatically check GitHub Releases and restart when a newer version is available")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	listenSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "listen" {
+			listenSet = true
+		}
+	})
+	cfEnabled := *trustCF || strings.TrimSpace(*cfEmail) != "" || strings.TrimSpace(*cfTeam) != "" || strings.TrimSpace(*cfAud) != ""
+	if cfEnabled && !listenSet {
+		*listen = "127.0.0.1:8090"
+	}
+	if cfEnabled && strings.TrimSpace(*cfTeam) == "" && strings.TrimSpace(*cfAud) == "" {
+		fmt.Fprintf(os.Stderr, "warning: Cloudflare Access header-only mode trusts loopback requests (127.0.0.1/::1) only; set --cf-access-team and --cf-access-aud for RS256 JWT verification\n")
 	}
 
 	if *dataDir == "" {
@@ -1227,20 +1262,22 @@ func cmdHub(args []string) error {
 	}
 
 	if *installSvc {
-		return installAndStartHub(*listen, *token, *dataDir, *publicURL, *trustCF, *cfEmail)
+		return installAndStartHub(*listen, *token, *dataDir, *publicURL, *trustCF, *cfEmail, *cfTeam, *cfAud)
 	}
 
 	srv, err := hub.NewServerWithOptions(hub.Options{
-		Token:         *token,
-		DataDir:       *dataDir,
-		TrustCFAccess: *trustCF,
-		CFAccessEmail: *cfEmail,
+		Token:              *token,
+		DataDir:            *dataDir,
+		TrustCFAccess:      *trustCF,
+		CFAccessEmail:      *cfEmail,
+		CFAccessTeamDomain: *cfTeam,
+		CFAccessAUD:        *cfAud,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Printf("ssh-fleet Hub listening on %s (version=%s, dataDir=%s, cfAccess=%v, autoUpdate=%v)\n",
-		*listen, version.Version, *dataDir, *trustCF || *cfEmail != "", *autoUpdate)
+		*listen, version.Version, *dataDir, cfEnabled, *autoUpdate)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1272,12 +1309,84 @@ func cmdHub(args []string) error {
 	}
 }
 
-func installAndStartHub(listen, token, dataDir, publicURL string, trustCF bool, cfEmail string) error {
+func validateEnvValue(name, val string) error {
+	if strings.ContainsAny(val, "\r\n\x00") {
+		return fmt.Errorf("%s contains unsupported control characters", name)
+	}
+	return nil
+}
+
+func writePrivateEnvFile(path string, lines []string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".hub.env.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	if _, err := tmp.WriteString(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func installAndStartHub(listen, token, dataDir, publicURL string, trustCF bool, cfEmail, cfTeam, cfAud string) error {
+	for k, v := range map[string]string{
+		"token":           token,
+		"cf-access-email": cfEmail,
+		"cf-access-team":  cfTeam,
+		"cf-access-aud":   cfAud,
+	} {
+		if err := validateEnvValue(k, v); err != nil {
+			return err
+		}
+	}
+
 	selfBin, err := os.Executable()
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return err
+	}
+
+	envLines := []string{"SF_HUB_TOKEN=" + token}
+	if e := strings.TrimSpace(cfEmail); e != "" {
+		envLines = append(envLines, "SF_CF_ACCESS_EMAIL="+e)
+	}
+	if t := strings.TrimSpace(cfTeam); t != "" {
+		envLines = append(envLines, "SF_CF_ACCESS_TEAM="+t)
+	}
+	if a := strings.TrimSpace(cfAud); a != "" {
+		envLines = append(envLines, "SF_CF_ACCESS_AUD="+a)
+	}
+	envPath := filepath.Join(dataDir, "hub.env")
+	if err := writePrivateEnvFile(envPath, envLines); err != nil {
 		return err
 	}
 
@@ -1293,14 +1402,10 @@ func installAndStartHub(listen, token, dataDir, publicURL string, trustCF bool, 
 	_ = vault.SaveConfig(configPath(), cfg)
 
 	extraFlags := ""
-	extraArgs := []string{"hub", "--listen", listen, "--token", token, "--data-dir", dataDir}
+	extraArgs := []string{"hub", "--listen", listen, "--data-dir", dataDir}
 	if trustCF {
 		extraFlags += " --trust-cf-access"
 		extraArgs = append(extraArgs, "--trust-cf-access")
-	}
-	if strings.TrimSpace(cfEmail) != "" {
-		extraFlags += fmt.Sprintf(" --cf-access-email %q", cfEmail)
-		extraArgs = append(extraArgs, "--cf-access-email", cfEmail)
 	}
 
 	startedMsg := ""
@@ -1315,13 +1420,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart="%s" hub --listen "%s" --token "%s" --data-dir "%s"%s
+EnvironmentFile="%s"
+ExecStart="%s" hub --listen "%s" --data-dir "%s"%s
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-`, selfBin, listen, token, dataDir, extraFlags)
+`, envPath, selfBin, listen, dataDir, extraFlags)
 			if err := os.WriteFile(unitPath, []byte(unit), 0644); err != nil {
 				return err
 			}
@@ -1339,13 +1445,14 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart="%s" hub --listen "%s" --token "%s" --data-dir "%s"%s
+EnvironmentFile="%s"
+ExecStart="%s" hub --listen "%s" --data-dir "%s"%s
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=default.target
-`, selfBin, listen, token, dataDir, extraFlags)
+`, envPath, selfBin, listen, dataDir, extraFlags)
 			_ = os.WriteFile(unitPath, []byte(unit), 0644)
 			_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
 			if err := exec.Command("systemctl", "--user", "enable", "--now", "ssh-fleet-hub").Run(); err == nil {
@@ -1356,14 +1463,14 @@ WantedBy=default.target
 			}
 		}
 		if startedMsg == "" {
-			logPath, err := startDetachedProcess(selfBin, extraArgs, "hub.log")
+			logPath, err := startDetachedProcessWithEnv(selfBin, extraArgs, envLines, "hub.log")
 			if err != nil {
 				return err
 			}
 			startedMsg = "detached background process (log: " + logPath + ")"
 		}
 	default:
-		logPath, err := startDetachedProcess(selfBin, extraArgs, "hub.log")
+		logPath, err := startDetachedProcessWithEnv(selfBin, extraArgs, envLines, "hub.log")
 		if err != nil {
 			return err
 		}
@@ -1598,6 +1705,10 @@ func installAndStartAgent(selfBin string, cfg vault.LocalConfig) (string, error)
 }
 
 func startDetachedProcess(binPath string, args []string, logName string) (string, error) {
+	return startDetachedProcessWithEnv(binPath, args, nil, logName)
+}
+
+func startDetachedProcessWithEnv(binPath string, args []string, extraEnv []string, logName string) (string, error) {
 	dir, err := vault.DefaultConfigDir()
 	if err != nil {
 		return "", err
@@ -1611,6 +1722,9 @@ func startDetachedProcess(binPath string, args []string, logName string) (string
 		return "", err
 	}
 	cmd := exec.Command(binPath, args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = mergeEnv(os.Environ(), extraEnv)
+	}
 	cmd.Stdout = f
 	cmd.Stderr = f
 	if err := cmd.Start(); err != nil {
@@ -1620,6 +1734,25 @@ func startDetachedProcess(binPath string, args []string, logName string) (string
 	_ = cmd.Process.Release()
 	_ = f.Close()
 	return logPath, nil
+}
+
+func mergeEnv(base, overrides []string) []string {
+	overrideKeys := make(map[string]struct{}, len(overrides))
+	for _, kv := range overrides {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			overrideKeys[k] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(base)+len(overrides))
+	for _, kv := range base {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			if _, replaced := overrideKeys[k]; replaced {
+				continue
+			}
+		}
+		out = append(out, kv)
+	}
+	return append(out, overrides...)
 }
 
 func detectPublicOrLocalIP() string {
