@@ -43,6 +43,7 @@ type NodeInfo struct {
 	NodeID      string         `json:"node_id"`
 	Name        string         `json:"name"`
 	CustomName  bool           `json:"custom_name,omitempty"`
+	Version     string         `json:"version,omitempty"`
 	Hostname    string         `json:"hostname"`
 	OS          string         `json:"os"`
 	Arch        string         `json:"arch"`
@@ -76,6 +77,10 @@ type ControlFrame struct {
 	TargetPort    int        `json:"target_port,omitempty"`
 	Password      string     `json:"password,omitempty"`
 	KeyringLocked *bool      `json:"keyring_locked,omitempty"`
+	Cols          int        `json:"cols,omitempty"`
+	Rows          int        `json:"rows,omitempty"`
+	Version       string     `json:"version,omitempty"`
+	Updated       bool       `json:"updated,omitempty"`
 	OK            bool       `json:"ok,omitempty"`
 	Error         string     `json:"error,omitempty"`
 }

@@ -3,11 +3,13 @@ package agent
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -21,26 +23,32 @@ import (
 	"ssh-fleet/internal/keyring"
 	"ssh-fleet/internal/power"
 	"ssh-fleet/internal/protocol"
+	"ssh-fleet/internal/updater"
+	"ssh-fleet/internal/version"
 	"ssh-fleet/internal/wol"
 	"ssh-fleet/internal/ws"
 )
 
 type Options struct {
-	HubURL         string
-	Token          string
-	CFClientID     string
-	CFClientSecret string
-	NodeID         string
-	Name           string
-	SSHPort        int
-	SSHUser        string
-	IsVPS          *bool
-	Power          *power.Manager
-	Keyring        keyring.Handler
-	WoLHandler     func(mac, broadcastIP string) error
-	NetworkInfoFn  func() ([]wol.NetInterfaceInfo, error)
-	PingInterval   time.Duration
-	ReconnectDelay time.Duration
+	HubURL            string
+	Token             string
+	CFClientID        string
+	CFClientSecret    string
+	NodeID            string
+	Name              string
+	SSHPort           int
+	SSHUser           string
+	IsVPS             *bool
+	Power             *power.Manager
+	Keyring           keyring.Handler
+	WoLHandler        func(mac, broadcastIP string) error
+	NetworkInfoFn     func() ([]wol.NetInterfaceInfo, error)
+	UpdateFn          func(context.Context) (updater.Result, error)
+	OnUpdated         func(string)
+	PingInterval      time.Duration
+	ReconnectDelay    time.Duration
+	MaxReconnectDelay time.Duration
+	AuthBackoffDelay  time.Duration
 }
 
 type Client struct {
@@ -107,6 +115,15 @@ func NewClient(opts Options) (*Client, error) {
 	if opts.ReconnectDelay <= 0 {
 		opts.ReconnectDelay = 3 * time.Second
 	}
+	if opts.MaxReconnectDelay <= 0 {
+		opts.MaxReconnectDelay = 60 * time.Second
+	}
+	if opts.MaxReconnectDelay < opts.ReconnectDelay {
+		opts.MaxReconnectDelay = opts.ReconnectDelay
+	}
+	if opts.AuthBackoffDelay <= 0 {
+		opts.AuthBackoffDelay = 30 * time.Second
+	}
 	isVPS := DetectIsVPS()
 	if opts.IsVPS != nil {
 		isVPS = *opts.IsVPS
@@ -171,26 +188,64 @@ func (c *Client) waitReconnectHold(ctx context.Context) error {
 }
 
 func (c *Client) Run(ctx context.Context) error {
+	attempt := 0
 	for {
 		if err := c.waitReconnectHold(ctx); err != nil {
 			c.power.Close()
 			return err
 		}
-		err := c.connectOnce(ctx)
+		registered, err := c.connectOnce(ctx)
+		if registered {
+			attempt = 0
+		}
 		if ctx.Err() != nil {
 			c.power.Close()
 			return ctx.Err()
 		}
 		if err != nil {
+			var delay time.Duration
+			var uerr *ws.UpgradeError
+			if errors.As(err, &uerr) && (uerr.StatusCode == http.StatusUnauthorized || uerr.StatusCode == http.StatusForbidden) {
+				delay = c.opts.AuthBackoffDelay
+			} else {
+				shift := attempt
+				if shift > 6 {
+					shift = 6
+				}
+				delay = c.opts.ReconnectDelay << shift
+				if delay <= 0 || delay > c.opts.MaxReconnectDelay {
+					delay = c.opts.MaxReconnectDelay
+				}
+				attempt++
+			}
+			delay = jitterDuration(delay)
 			// Keep reconnecting reliably across Wi-Fi / sleep transitions.
+			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				c.power.Close()
 				return ctx.Err()
-			case <-time.After(c.opts.ReconnectDelay):
+			case <-timer.C:
 			}
 		}
 	}
+}
+
+func jitterDuration(d time.Duration) time.Duration {
+	if d < 20*time.Millisecond {
+		return d
+	}
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return d
+	}
+	delta := (int64(b[0])*2 - 255) * int64(d) / (255 * 5)
+	out := d + time.Duration(delta)
+	if out <= 0 {
+		return d
+	}
+	return out
 }
 
 func (c *Client) probeKeyringLocked(ctx context.Context) *bool {
@@ -232,6 +287,7 @@ func (c *Client) buildNodeInfo() protocol.NodeInfo {
 	return protocol.NodeInfo{
 		NodeID:        c.opts.NodeID,
 		Name:          c.opts.Name,
+		Version:       version.Version,
 		Hostname:      host,
 		OS:            runtime.GOOS,
 		Arch:          runtime.GOARCH,
@@ -248,10 +304,10 @@ func (c *Client) buildNodeInfo() protocol.NodeInfo {
 	}
 }
 
-func (c *Client) connectOnce(ctx context.Context) error {
+func (c *Client) connectOnce(ctx context.Context) (bool, error) {
 	conn, br, err := DialUpgradeWithHeaders(ctx, c.opts.HubURL, "/tunnel/control", c.opts.Token, "ssh-fleet-control", c.cfHeaders())
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close()
 
@@ -275,7 +331,7 @@ func (c *Client) connectOnce(ctx context.Context) error {
 		Type: "register",
 		Node: &nodeInfo,
 	}); err != nil {
-		return err
+		return false, err
 	}
 
 	done := make(chan struct{})
@@ -314,6 +370,7 @@ func (c *Client) connectOnce(ctx context.Context) error {
 		readTimeout = 45 * time.Second
 	}
 
+	registered := false
 	scanner := bufio.NewScanner(br)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for {
@@ -332,24 +389,30 @@ func (c *Client) connectOnce(ctx context.Context) error {
 
 		switch frame.Type {
 		case "pong", "register-ack":
-			// Read deadline is refreshed at the top of the loop.
+			registered = true
+		case "replaced":
+			c.setReconnectHold(20 * time.Second)
+			_ = conn.Close()
+			return registered, errors.New("connection replaced by another agent with same node_id")
 		case "open-ssh-stream":
-			go c.handleOpenStream(ctx, frame.StreamID)
+			go c.handleOpenStream(ctx, sendFrame, frame.StreamID)
 		case "open-shell-stream":
-			go c.handleOpenShellStream(ctx, frame.StreamID)
+			go c.handleOpenShellStream(ctx, sendFrame, frame.StreamID, frame.Cols, frame.Rows)
 		case "power-cmd":
 			go c.handlePowerCmd(sendFrame, func() { _ = conn.Close() }, frame)
 		case "wol-cmd":
 			go c.handleWolCmd(sendFrame, frame)
 		case "unlock-keyring":
 			go c.handleUnlockKeyring(ctx, sendFrame, frame)
+		case "self-update":
+			go c.handleSelfUpdate(ctx, sendFrame, func() { _ = conn.Close() }, frame)
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return err
+		return registered, err
 	}
-	return io.EOF
+	return registered, io.EOF
 }
 
 func (c *Client) cfHeaders() map[string]string {
@@ -363,35 +426,60 @@ func (c *Client) cfHeaders() map[string]string {
 	return h
 }
 
-func (c *Client) handleOpenStream(ctx context.Context, streamID string) {
+func (c *Client) handleOpenStream(ctx context.Context, sendFrame func(protocol.ControlFrame) error, streamID string) {
 	if streamID == "" {
 		return
 	}
 	localConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", c.opts.SSHPort), 5*time.Second)
 	if err != nil {
+		_ = sendFrame(protocol.ControlFrame{
+			Type:     "stream-error",
+			StreamID: streamID,
+			Error:    fmt.Sprintf("local ssh port %d unreachable: %v", c.opts.SSHPort, err),
+		})
 		return
 	}
 
 	remoteConn, br, err := DialUpgradeWithHeaders(ctx, c.opts.HubURL, "/tunnel/agent-stream?stream_id="+url.QueryEscape(streamID), c.opts.Token, "ssh-fleet-stream", c.cfHeaders())
 	if err != nil {
 		_ = localConn.Close()
+		_ = sendFrame(protocol.ControlFrame{
+			Type:     "stream-error",
+			StreamID: streamID,
+			Error:    err.Error(),
+		})
 		return
 	}
 
 	spliceBuffered(localConn, remoteConn, br)
 }
 
-func (c *Client) handleOpenShellStream(ctx context.Context, streamID string) {
+func (c *Client) handleOpenShellStream(ctx context.Context, sendFrame func(protocol.ControlFrame) error, streamID string, cols, rows int) {
 	if streamID == "" {
 		return
 	}
 	remoteConn, br, err := DialUpgradeWithHeaders(ctx, c.opts.HubURL, "/tunnel/agent-stream?stream_id="+url.QueryEscape(streamID), c.opts.Token, "ssh-fleet-stream", c.cfHeaders())
 	if err != nil {
+		_ = sendFrame(protocol.ControlFrame{
+			Type:     "stream-error",
+			StreamID: streamID,
+			Error:    err.Error(),
+		})
 		return
 	}
 	defer remoteConn.Close()
 
-	cmd := buildInteractiveShellCmd()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = remoteConn.Close()
+		case <-done:
+		}
+	}()
+
+	cmd := buildInteractiveShellCmd(cols, rows)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return
@@ -426,6 +514,7 @@ func (c *Client) handleOpenShellStream(ctx context.Context, streamID string) {
 			n, rErr := stdout.Read(buf)
 			if n > 0 {
 				if err := safeWrite(buf[:n]); err != nil {
+					_ = remoteConn.Close()
 					break
 				}
 			}
@@ -441,6 +530,7 @@ func (c *Client) handleOpenShellStream(ctx context.Context, streamID string) {
 			n, rErr := stderr.Read(buf)
 			if n > 0 {
 				if err := safeWrite(buf[:n]); err != nil {
+					_ = remoteConn.Close()
 					break
 				}
 			}
@@ -450,31 +540,111 @@ func (c *Client) handleOpenShellStream(ctx context.Context, streamID string) {
 		}
 	}()
 
+	pipesDone := make(chan struct{})
+	stdinDone := make(chan struct{})
 	go func() {
+		defer close(stdinDone)
 		_, _ = io.Copy(stdin, br)
 		_ = stdin.Close()
+		timer := time.NewTimer(250 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-pipesDone:
+			return
+		case <-timer.C:
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			_ = remoteConn.Close()
+		}
 	}()
 
 	wg.Wait()
+	close(pipesDone)
+	_ = remoteConn.Close()
+	<-stdinDone
 	_ = cmd.Wait()
 }
 
-func buildInteractiveShellCmd() *exec.Cmd {
+func isSafeShellPath(sh string) bool {
+	if sh == "" {
+		return false
+	}
+	return !strings.ContainsAny(sh, " \t\r\n;&|$`'\"<>()\\")
+}
+
+func setEnvEntry(base []string, key, val string, overwrite bool) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(base)+1)
+	seen := false
+	for _, entry := range base {
+		if strings.HasPrefix(entry, prefix) {
+			if !seen {
+				existing := strings.TrimSpace(strings.TrimPrefix(entry, prefix))
+				if !overwrite && existing != "" {
+					out = append(out, entry)
+				} else {
+					out = append(out, prefix+val)
+				}
+				seen = true
+			}
+			continue
+		}
+		out = append(out, entry)
+	}
+	if !seen {
+		out = append(out, prefix+val)
+	}
+	return out
+}
+
+func shellEnv(base []string) []string {
+	env := setEnvEntry(base, "TERM", "xterm-256color", true)
+	env = setEnvEntry(env, "COLORTERM", "truecolor", true)
+	env = setEnvEntry(env, "LANG", "en_US.UTF-8", false)
+	return env
+}
+
+func clampTermSize(cols, rows int) (int, int) {
+	if cols <= 0 || rows <= 0 {
+		return 0, 0
+	}
+	if cols < 20 {
+		cols = 20
+	} else if cols > 500 {
+		cols = 500
+	}
+	if rows < 5 {
+		rows = 5
+	} else if rows > 200 {
+		rows = 200
+	}
+	return cols, rows
+}
+
+func buildInteractiveShellCmd(cols, rows int) *exec.Cmd {
+	cols, rows = clampTermSize(cols, rows)
+	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		return exec.Command("powershell.exe", "-NoLogo")
+		cmd = exec.Command("powershell.exe", "-NoLogo")
 	case "darwin":
-		sh := os.Getenv("SHELL")
-		if sh == "" {
+		sh := strings.TrimSpace(os.Getenv("SHELL"))
+		if !isSafeShellPath(sh) {
 			sh = "/bin/zsh"
 		}
 		if _, err := exec.LookPath("script"); err == nil {
-			return exec.Command("script", "-q", "/dev/null", sh, "-i")
+			if cols > 0 && rows > 0 {
+				cmd = exec.Command("script", "-q", "/dev/null", sh, "-c", fmt.Sprintf("stty cols %d rows %d 2>/dev/null; exec %s -i", cols, rows, sh))
+			} else {
+				cmd = exec.Command("script", "-q", "/dev/null", sh, "-i")
+			}
+		} else {
+			cmd = exec.Command(sh, "-i")
 		}
-		return exec.Command(sh, "-i")
 	default:
-		sh := os.Getenv("SHELL")
-		if sh == "" {
+		sh := strings.TrimSpace(os.Getenv("SHELL"))
+		if !isSafeShellPath(sh) {
 			if _, err := exec.LookPath("bash"); err == nil {
 				sh = "/bin/bash"
 			} else {
@@ -482,10 +652,17 @@ func buildInteractiveShellCmd() *exec.Cmd {
 			}
 		}
 		if _, err := exec.LookPath("script"); err == nil {
-			return exec.Command("script", "-q", "-c", sh+" -i", "/dev/null")
+			if cols > 0 && rows > 0 {
+				cmd = exec.Command("script", "-q", "-c", fmt.Sprintf("stty cols %d rows %d 2>/dev/null; exec %s -i", cols, rows, sh), "/dev/null")
+			} else {
+				cmd = exec.Command("script", "-q", "-c", sh+" -i", "/dev/null")
+			}
+		} else {
+			cmd = exec.Command(sh, "-i")
 		}
-		return exec.Command(sh, "-i")
 	}
+	cmd.Env = shellEnv(os.Environ())
+	return cmd
 }
 
 func (c *Client) handlePowerCmd(sendFrame func(protocol.ControlFrame) error, closeConn func(), frame protocol.ControlFrame) {
@@ -624,6 +801,43 @@ func (c *Client) handleWolCmd(sendFrame func(protocol.ControlFrame) error, frame
 	})
 }
 
+func (c *Client) handleSelfUpdate(ctx context.Context, sendFrame func(protocol.ControlFrame) error, closeConn func(), frame protocol.ControlFrame) {
+	updCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	var res updater.Result
+	var err error
+	if c.opts.UpdateFn != nil {
+		res, err = c.opts.UpdateFn(updCtx)
+	} else {
+		res, err = updater.CheckAndApply(updCtx, updater.Options{
+			CurrentVersion:  version.Version,
+			RequireChecksum: true,
+		})
+	}
+	_ = sendFrame(protocol.ControlFrame{
+		Type:    "self-update-ack",
+		ReqID:   frame.ReqID,
+		OK:      err == nil,
+		Updated: res.Updated,
+		Version: res.LatestVersion,
+		Error:   errString(err),
+	})
+	if err == nil && res.Updated {
+		time.AfterFunc(250*time.Millisecond, func() {
+			if c.opts.OnUpdated != nil {
+				c.opts.OnUpdated(res.BinaryPath)
+				return
+			}
+			if closeConn != nil {
+				closeConn()
+			}
+			c.power.Close()
+			_ = updater.ReExec(res.BinaryPath)
+		})
+	}
+}
+
 // DialUpgrade opens a raw TCP/TLS HTTP/1.1 Upgrade connection to the Hub.
 func DialUpgrade(ctx context.Context, baseURL, pathWithQuery, token, proto string) (net.Conn, *bufio.Reader, error) {
 	return DialUpgradeWithHeaders(ctx, baseURL, pathWithQuery, token, proto, nil)
@@ -738,6 +952,8 @@ func spliceBuffered(local net.Conn, remote net.Conn, remoteReader *bufio.Reader)
 		_, _ = io.Copy(local, remoteReader)
 		if tc, ok := local.(interface{ CloseWrite() error }); ok {
 			_ = tc.CloseWrite()
+		} else {
+			_ = local.Close()
 		}
 	}()
 	go func() {
@@ -745,6 +961,8 @@ func spliceBuffered(local net.Conn, remote net.Conn, remoteReader *bufio.Reader)
 		_, _ = io.Copy(remote, local)
 		if tc, ok := remote.(interface{ CloseWrite() error }); ok {
 			_ = tc.CloseWrite()
+		} else {
+			_ = remote.Close()
 		}
 	}()
 	wg.Wait()

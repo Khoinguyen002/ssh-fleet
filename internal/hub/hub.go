@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"ssh-fleet/internal/protocol"
+	"ssh-fleet/internal/version"
 	"ssh-fleet/internal/ws"
 )
 
@@ -45,11 +47,13 @@ func wrapHijackedConn(conn net.Conn, rw *bufio.ReadWriter) net.Conn {
 }
 
 type activeAgent struct {
-	nodeID string
-	conn   net.Conn
-	writeM sync.Mutex
-	closed chan struct{}
-	once   sync.Once
+	nodeID     string
+	conn       net.Conn
+	writeM     sync.Mutex
+	pendingMu  sync.Mutex
+	pendingReq map[string]chan protocol.ControlFrame
+	closed     chan struct{}
+	once       sync.Once
 }
 
 func (a *activeAgent) send(f protocol.ControlFrame) error {
@@ -73,19 +77,26 @@ func (a *activeAgent) close() {
 	})
 }
 
-type pendingAck struct {
-	ch chan protocol.ControlFrame
+type pendingStream struct {
+	nodeID string
+	ch     chan net.Conn
+	errCh  chan string
+	mu     sync.Mutex
+	closed bool
 }
 
 type Options struct {
-	Token            string
-	DataDir          string
-	TrustCFAccess    bool
-	CFAccessEmail    string
-	AgentReadTimeout time.Duration
-	ESP32ReadTimeout time.Duration
-	SoftWakeTimeout  time.Duration
-	KeyringUnlockTTL time.Duration
+	Token              string
+	DataDir            string
+	TrustCFAccess      bool
+	CFAccessEmail      string
+	CFAccessTeamDomain string
+	CFAccessAUD        string
+	CFAccessJWKSURL    string
+	AgentReadTimeout   time.Duration
+	ESP32ReadTimeout   time.Duration
+	SoftWakeTimeout    time.Duration
+	KeyringUnlockTTL   time.Duration
 }
 
 type authRole int
@@ -131,6 +142,9 @@ type Server struct {
 	dataDir               string
 	trustCFAccess         bool
 	cfEmails              []string
+	cfVerifier            *cfAccessVerifier
+	loginLimiter          *ipRateLimiter
+	joinLimiter           *ipRateLimiter
 	agentReadTimeout      time.Duration
 	esp32ReadTimeout      time.Duration
 	softWakeTimeout       time.Duration
@@ -142,10 +156,9 @@ type Server struct {
 	nodes                 map[string]*protocol.NodeInfo
 	agents                map[string]*activeAgent
 	esp32Relays           map[string]*esp32WakeRelay
-	pendingReq            map[string]*pendingAck
 	pendingKeyringUnlocks map[string]*pendingKeyringUnlock
 	keyringStatus         map[string]keyringUnlockStatus
-	streams               map[string]chan net.Conn
+	streams               map[string]*pendingStream
 	httpSrv               *http.Server
 }
 
@@ -177,6 +190,10 @@ func NewServerWithOptions(opts Options) (*Server, error) {
 	if opts.KeyringUnlockTTL <= 0 {
 		opts.KeyringUnlockTTL = 5 * time.Minute
 	}
+	cfVerifier, err := newCFAccessVerifier(opts.CFAccessTeamDomain, opts.CFAccessAUD, opts.CFAccessJWKSURL)
+	if err != nil {
+		return nil, err
+	}
 	var emails []string
 	for _, e := range strings.Split(opts.CFAccessEmail, ",") {
 		e = strings.ToLower(strings.TrimSpace(e))
@@ -184,12 +201,15 @@ func NewServerWithOptions(opts Options) (*Server, error) {
 			emails = append(emails, e)
 		}
 	}
-	trustCF := opts.TrustCFAccess || len(emails) > 0
+	trustCF := opts.TrustCFAccess || len(emails) > 0 || cfVerifier != nil
 	s := &Server{
 		token:                 opts.Token,
 		dataDir:               opts.DataDir,
 		trustCFAccess:         trustCF,
 		cfEmails:              emails,
+		cfVerifier:            cfVerifier,
+		loginLimiter:          newIPRateLimiter(10, time.Minute),
+		joinLimiter:           newIPRateLimiter(10, time.Minute),
 		agentReadTimeout:      opts.AgentReadTimeout,
 		esp32ReadTimeout:      opts.ESP32ReadTimeout,
 		softWakeTimeout:       opts.SoftWakeTimeout,
@@ -200,10 +220,9 @@ func NewServerWithOptions(opts Options) (*Server, error) {
 		nodes:                 make(map[string]*protocol.NodeInfo),
 		agents:                make(map[string]*activeAgent),
 		esp32Relays:           make(map[string]*esp32WakeRelay),
-		pendingReq:            make(map[string]*pendingAck),
 		pendingKeyringUnlocks: make(map[string]*pendingKeyringUnlock),
 		keyringStatus:         make(map[string]keyringUnlockStatus),
-		streams:               make(map[string]chan net.Conn),
+		streams:               make(map[string]*pendingStream),
 	}
 	s.loadPersistedNodes()
 	return s, nil
@@ -239,7 +258,11 @@ func (s *Server) ListenAndServe(addr string) error {
 	if err != nil {
 		return err
 	}
-	s.httpSrv = &http.Server{Handler: s.Handler()}
+	s.httpSrv = &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	return s.httpSrv.Serve(ln)
 }
 
@@ -294,13 +317,26 @@ func (s *Server) authenticateRequest(r *http.Request) (authRole, string) {
 		}
 	}
 
-	if qTok := strings.TrimSpace(r.URL.Query().Get("token")); qTok != "" {
-		if role, sub := s.classifyToken(qTok); role != authNone {
-			return role, sub
+	if s.cfVerifier != nil {
+		email, ok := s.cfVerifier.VerifyRequest(r)
+		if !ok {
+			return authNone, ""
 		}
+		if len(s.cfEmails) == 0 {
+			if email == "" {
+				return authAdmin, "cf-access-user"
+			}
+			return authAdmin, email
+		}
+		for _, allowed := range s.cfEmails {
+			if email == allowed {
+				return authAdmin, email
+			}
+		}
+		return authNone, ""
 	}
 
-	if s.trustCFAccess {
+	if s.trustCFAccess && isLoopbackRemoteAddr(r.RemoteAddr) {
 		cfEmail := strings.ToLower(strings.TrimSpace(r.Header.Get("Cf-Access-Authenticated-User-Email")))
 		if cfEmail != "" {
 			if len(s.cfEmails) == 0 {
@@ -311,8 +347,6 @@ func (s *Server) authenticateRequest(r *http.Request) (authRole, string) {
 					return authAdmin, cfEmail
 				}
 			}
-		} else if len(s.cfEmails) == 0 && strings.TrimSpace(r.Header.Get("Cf-Access-Jwt-Assertion")) != "" {
-			return authAdmin, "cf-access-user"
 		}
 	}
 
@@ -353,9 +387,23 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func isRequestHTTPS(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.loginLimiter.Allow(r) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": "too many login attempts, try again later"})
 		return
 	}
 	var body struct {
@@ -374,6 +422,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    s.token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   isRequestHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   86400 * 30,
 	})
@@ -397,6 +446,7 @@ func (s *Server) handleHubInfo(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                  true,
+		"version":             version.Version,
 		"hub_token_redacted":  redactToken(s.token),
 		"join_token_ttl_sec":  int(DefaultJoinTokenTTL.Seconds()),
 		"esp32_relays_online": espCount,
@@ -422,6 +472,10 @@ func (s *Server) handleJoinExchange(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.joinLimiter.Allow(r) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": "too many join attempts, try again later"})
+		return
+	}
 	var body struct {
 		JoinToken string `json:"join_token"`
 		NodeID    string `json:"node_id"`
@@ -430,11 +484,28 @@ func (s *Server) handleJoinExchange(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request body"})
 		return
 	}
+	nodeID := strings.TrimSpace(body.NodeID)
+	if nodeID != "" {
+		if err := ValidateNodeID(nodeID); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		s.mu.RLock()
+		_, online := s.agents[nodeID]
+		s.mu.RUnlock()
+		if online {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"ok":    false,
+				"error": "node_id is already online; disconnect or delete it first, or choose a different node_id",
+			})
+			return
+		}
+	}
 	if !s.joinTokens.Consume(body.JoinToken) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "one-time join token is invalid, expired, or already used"})
 		return
 	}
-	nodeTok := s.nodeCreds.Issue(body.NodeID)
+	nodeTok := s.nodeCreds.Issue(nodeID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"node_token": nodeTok,
@@ -498,7 +569,7 @@ func (s *Server) persistNodesLocked() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(p, append(b, '\n'), 0600)
+	_ = writeFileAtomic(p, append(b, '\n'), 0600)
 }
 
 func (s *Server) ListNodes() []protocol.NodeInfo {
@@ -529,6 +600,7 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
+		"hub_version": version.Version,
 		"nodes":       s.ListNodes(),
 		"wake_relays": s.ListWakeRelays(),
 	})
@@ -671,12 +743,27 @@ func (s *Server) handleVault(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(b)
 	case http.MethodPut:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 8*1024*1024))
+		body, err := io.ReadAll(io.LimitReader(r.Body, 8*1024*1024+1))
 		if err != nil || len(body) == 0 {
 			http.Error(w, `{"ok":false,"error":"empty vault payload"}`, http.StatusBadRequest)
 			return
 		}
-		if err := os.WriteFile(vp, body, 0600); err != nil {
+		if len(body) > 8*1024*1024 {
+			http.Error(w, `{"ok":false,"error":"vault payload exceeds 8MB limit"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		var env struct {
+			Magic      string `json:"magic"`
+			Ciphertext string `json:"ciphertext"`
+		}
+		if err := json.Unmarshal(body, &env); err != nil || env.Magic != "SFV1" || strings.TrimSpace(env.Ciphertext) == "" {
+			http.Error(w, `{"ok":false,"error":"invalid vault envelope: expected SFV1 JSON with ciphertext"}`, http.StatusBadRequest)
+			return
+		}
+		if oldBytes, rErr := os.ReadFile(vp); rErr == nil && len(oldBytes) > 0 {
+			_ = writeFileAtomic(vp+".bak", oldBytes, 0600)
+		}
+		if err := writeFileAtomic(vp, body, 0600); err != nil {
 			http.Error(w, fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
@@ -871,6 +958,49 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 
 		res, status := s.unlockWithAgent(nodeID, agent, req.Password, 8*time.Second)
 		writeJSON(w, status, res)
+		return
+	}
+
+	if parts[1] == "update" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if role != authAdmin {
+			writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "admin authentication required"})
+			return
+		}
+		s.mu.RLock()
+		_, exists := s.nodes[nodeID]
+		agent := s.agents[nodeID]
+		s.mu.RUnlock()
+		if !exists {
+			writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "node not found"})
+			return
+		}
+		if agent == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "target node is offline"})
+			return
+		}
+		ack, err := s.sendAndWait(agent, protocol.ControlFrame{Type: "self-update"}, 30*time.Second)
+		if err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "node_id": nodeID, "error": err.Error()})
+			return
+		}
+		if !ack.OK {
+			msg := ack.Error
+			if msg == "" {
+				msg = "remote update failed"
+			}
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "node_id": nodeID, "error": msg})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"node_id": nodeID,
+			"updated": ack.Updated,
+			"version": ack.Version,
+		})
 		return
 	}
 
@@ -1283,24 +1413,30 @@ func (s *Server) sendAndWait(agent *activeAgent, frame protocol.ControlFrame, ti
 	frame.ReqID = reqID
 	ch := make(chan protocol.ControlFrame, 1)
 
-	s.mu.Lock()
-	s.pendingReq[reqID] = &pendingAck{ch: ch}
-	s.mu.Unlock()
+	agent.pendingMu.Lock()
+	if agent.pendingReq == nil {
+		agent.pendingReq = make(map[string]chan protocol.ControlFrame)
+	}
+	agent.pendingReq[reqID] = ch
+	agent.pendingMu.Unlock()
 
 	defer func() {
-		s.mu.Lock()
-		delete(s.pendingReq, reqID)
-		s.mu.Unlock()
+		agent.pendingMu.Lock()
+		delete(agent.pendingReq, reqID)
+		agent.pendingMu.Unlock()
 	}()
 
 	if err := agent.send(frame); err != nil {
 		return protocol.ControlFrame{}, err
 	}
 
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case resp := <-ch:
 		return resp, nil
-	case <-time.After(timeout):
+	case <-timer.C:
 		select {
 		case resp := <-ch:
 			return resp, nil
@@ -1368,6 +1504,10 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	regNodeID := strings.TrimSpace(reg.Node.NodeID)
+	if err := ValidateNodeID(regNodeID); err != nil {
+		_ = hConn.Close()
+		return
+	}
 	if role == authNode && regNodeID != boundNodeID {
 		_ = hConn.Close()
 		return
@@ -1386,15 +1526,14 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 	node.LastSeen = now
 
 	agent := &activeAgent{
-		nodeID: node.NodeID,
-		conn:   hConn,
-		closed: make(chan struct{}),
+		nodeID:     node.NodeID,
+		conn:       hConn,
+		pendingReq: make(map[string]chan protocol.ControlFrame),
+		closed:     make(chan struct{}),
 	}
 
 	s.mu.Lock()
-	if old := s.agents[node.NodeID]; old != nil {
-		old.close()
-	}
+	old := s.agents[node.NodeID]
 	if prevNode := s.nodes[node.NodeID]; prevNode != nil {
 		if prevNode.WoL != nil {
 			node.WoL = prevNode.WoL
@@ -1408,6 +1547,14 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 	s.nodes[node.NodeID] = &node
 	s.persistNodesLocked()
 	s.mu.Unlock()
+
+	if old != nil {
+		_ = old.send(protocol.ControlFrame{
+			Type:  "replaced",
+			Error: "replaced by newer connection for same node_id",
+		})
+		old.close()
+	}
 
 	_ = agent.send(protocol.ControlFrame{Type: "register-ack", OK: true})
 
@@ -1500,7 +1647,7 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 				s.persistNodesLocked()
 			}
 			s.mu.Unlock()
-		case "power-ack", "wol-ack", "unlock-keyring-ack":
+		case "power-ack", "wol-ack", "unlock-keyring-ack", "self-update-ack":
 			if frame.Type == "unlock-keyring-ack" && frame.KeyringLocked != nil {
 				s.mu.Lock()
 				if n, exists := s.nodes[node.NodeID]; exists {
@@ -1510,12 +1657,28 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 				s.mu.Unlock()
 			}
 			if frame.ReqID != "" {
-				s.mu.RLock()
-				p := s.pendingReq[frame.ReqID]
-				s.mu.RUnlock()
-				if p != nil {
+				agent.pendingMu.Lock()
+				ch := agent.pendingReq[frame.ReqID]
+				agent.pendingMu.Unlock()
+				if ch != nil {
 					select {
-					case p.ch <- frame:
+					case ch <- frame:
+					default:
+					}
+				}
+			}
+		case "stream-error":
+			if frame.StreamID != "" {
+				s.mu.RLock()
+				ps := s.streams[frame.StreamID]
+				s.mu.RUnlock()
+				if ps != nil && ps.nodeID == node.NodeID {
+					msg := strings.TrimSpace(frame.Error)
+					if msg == "" {
+						msg = "agent failed to open target stream"
+					}
+					select {
+					case ps.errCh <- msg:
 					default:
 					}
 				}
@@ -1524,7 +1687,47 @@ func (s *Server) handleControlTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) registerPendingStream(streamID, nodeID string) *pendingStream {
+	ps := &pendingStream{
+		nodeID: nodeID,
+		ch:     make(chan net.Conn, 1),
+		errCh:  make(chan string, 1),
+	}
+	s.mu.Lock()
+	s.streams[streamID] = ps
+	s.mu.Unlock()
+	return ps
+}
+
+func (s *Server) cleanupPendingStream(streamID string, ps *pendingStream) {
+	s.mu.Lock()
+	if cur := s.streams[streamID]; cur == ps {
+		delete(s.streams, streamID)
+	}
+	s.mu.Unlock()
+
+	ps.mu.Lock()
+	ps.closed = true
+	for {
+		select {
+		case c := <-ps.ch:
+			if c != nil {
+				_ = c.Close()
+			}
+		default:
+			ps.mu.Unlock()
+			return
+		}
+	}
+}
+
 func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
+	role, boundNodeID := s.authenticateRequest(r)
+	if role == authNone {
+		http.Error(w, `{"ok":false,"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
 	streamID := strings.TrimSpace(r.URL.Query().Get("stream_id"))
 	if streamID == "" {
 		http.Error(w, "missing stream_id", http.StatusBadRequest)
@@ -1532,10 +1735,14 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.RLock()
-	ch := s.streams[streamID]
+	ps := s.streams[streamID]
 	s.mu.RUnlock()
-	if ch == nil {
+	if ps == nil {
 		http.Error(w, "unknown or expired stream_id", http.StatusNotFound)
+		return
+	}
+	if role == authNode && boundNodeID != ps.nodeID {
+		http.Error(w, "forbidden: stream belongs to another node", http.StatusForbidden)
 		return
 	}
 
@@ -1543,9 +1750,17 @@ func (s *Server) handleAgentStream(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	ps.mu.Lock()
+	if ps.closed {
+		ps.mu.Unlock()
+		_ = wrapped.Close()
+		return
+	}
 	select {
-	case ch <- wrapped:
+	case ps.ch <- wrapped:
+		ps.mu.Unlock()
 	default:
+		ps.mu.Unlock()
 		_ = wrapped.Close()
 	}
 }
@@ -1554,6 +1769,10 @@ func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
 	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
 	if nodeID == "" {
 		http.Error(w, "missing node_id", http.StatusBadRequest)
+		return
+	}
+	if err := ValidateNodeID(nodeID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -1566,17 +1785,8 @@ func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	streamID := newRandomID(12)
-	streamCh := make(chan net.Conn, 1)
-
-	s.mu.Lock()
-	s.streams[streamID] = streamCh
-	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		delete(s.streams, streamID)
-		s.mu.Unlock()
-	}()
+	ps := s.registerPendingStream(streamID, nodeID)
+	defer s.cleanupPendingStream(streamID, ps)
 
 	if err := agent.send(protocol.ControlFrame{
 		Type:     "open-ssh-stream",
@@ -1586,10 +1796,26 @@ func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+
 	var agentConn net.Conn
 	select {
-	case agentConn = <-streamCh:
-	case <-time.After(10 * time.Second):
+	case agentConn = <-ps.ch:
+	case errMsg := <-ps.errCh:
+		http.Error(w, errMsg, http.StatusBadGateway)
+		return
+	case <-agent.closed:
+		select {
+		case agentConn = <-ps.ch:
+		case errMsg := <-ps.errCh:
+			http.Error(w, errMsg, http.StatusBadGateway)
+			return
+		default:
+			http.Error(w, "agent disconnected", http.StatusBadGateway)
+			return
+		}
+	case <-timer.C:
 		http.Error(w, "agent stream timeout", http.StatusGatewayTimeout)
 		return
 	case <-r.Context().Done():
@@ -1605,7 +1831,8 @@ func (s *Server) handleClientProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
-	ws, err := UpgradeWebSocket(w, r)
+	originOpts := ws.UpgradeOptions{CheckOrigin: sameHostOriginCheck}
+	ws, err := UpgradeWebSocketWithOptions(w, r, originOpts)
 	if err != nil {
 		return
 	}
@@ -1622,6 +1849,10 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 			_ = ws.WriteText("missing node_id\r\n")
 			return
 		}
+		if err := ValidateNodeID(nodeID); err != nil {
+			_ = ws.WriteText(err.Error() + "\r\n")
+			return
+		}
 		s.mu.RLock()
 		agent := s.agents[nodeID]
 		s.mu.RUnlock()
@@ -1631,28 +1862,42 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		streamID := newRandomID(12)
-		streamCh := make(chan net.Conn, 1)
-		s.mu.Lock()
-		s.streams[streamID] = streamCh
-		s.mu.Unlock()
-		defer func() {
-			s.mu.Lock()
-			delete(s.streams, streamID)
-			s.mu.Unlock()
-		}()
+		ps := s.registerPendingStream(streamID, nodeID)
+		defer s.cleanupPendingStream(streamID, ps)
+
+		cols, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("cols")))
+		rows, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("rows")))
 
 		if err := agent.send(protocol.ControlFrame{
 			Type:     "open-shell-stream",
 			StreamID: streamID,
+			Cols:     cols,
+			Rows:     rows,
 		}); err != nil {
 			_ = ws.WriteText("failed to contact agent\r\n")
 			return
 		}
 
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+
 		var agentConn net.Conn
 		select {
-		case agentConn = <-streamCh:
-		case <-time.After(10 * time.Second):
+		case agentConn = <-ps.ch:
+		case errMsg := <-ps.errCh:
+			_ = ws.WriteText(errMsg + "\r\n")
+			return
+		case <-agent.closed:
+			select {
+			case agentConn = <-ps.ch:
+			case errMsg := <-ps.errCh:
+				_ = ws.WriteText(errMsg + "\r\n")
+				return
+			default:
+				_ = ws.WriteText("agent disconnected before opening shell stream\r\n")
+				return
+			}
+		case <-timer.C:
 			_ = ws.WriteText("timed out waiting for agent shell stream\r\n")
 			return
 		case <-r.Context().Done():
@@ -1713,6 +1958,13 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		_ = ws.WriteText("invalid ssh session spec\r\n")
 		return
 	}
+	spec.Host = strings.TrimSpace(spec.Host)
+	spec.User = strings.TrimSpace(spec.User)
+	spec.NodeID = strings.TrimSpace(spec.NodeID)
+	if spec.User != "" && !isSafeSSHToken(spec.User) {
+		_ = ws.WriteText("invalid ssh user\r\n")
+		return
+	}
 
 	var tempFiles []string
 	defer func() {
@@ -1738,26 +1990,31 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if spec.NodeID != "" {
+		if err := ValidateNodeID(spec.NodeID); err != nil {
+			_ = ws.WriteText(err.Error() + "\r\n")
+			return
+		}
 		selfBin, _ := os.Executable()
-		if selfBin != "" {
-			listenAddr := "127.0.0.1:8090"
-			if s.httpSrv != nil && s.httpSrv.Addr != "" {
-				if strings.HasPrefix(s.httpSrv.Addr, ":") {
-					listenAddr = "127.0.0.1" + s.httpSrv.Addr
-				} else {
-					listenAddr = s.httpSrv.Addr
+		if selfBin != "" && !strings.ContainsAny(selfBin, "\r\n\x00") {
+			if runtime.GOOS == "windows" {
+				if !strings.Contains(selfBin, `"`) {
+					sshArgs = append(sshArgs, "-o", fmt.Sprintf("ProxyCommand=\"%s\" proxy %s", selfBin, spec.NodeID))
 				}
+			} else {
+				quotedBin := "'" + strings.ReplaceAll(selfBin, "'", "'\"'\"'") + "'"
+				sshArgs = append(sshArgs, "-o", fmt.Sprintf("ProxyCommand=%s proxy %s", quotedBin, spec.NodeID))
 			}
-			_ = listenAddr
-			// Spawn internal loopback bridge if needed; simplest portable path uses local sf config or agent stream.
-			sshArgs = append(sshArgs, "-o", fmt.Sprintf("ProxyCommand=\"%s\" proxy %s", selfBin, spec.NodeID))
 		}
 		dest := spec.NodeID
 		if spec.User != "" {
 			dest = spec.User + "@" + dest
 		}
-		sshArgs = append(sshArgs, dest)
+		sshArgs = append(sshArgs, "--", dest)
 	} else {
+		if !isSafeSSHToken(spec.Host) {
+			_ = ws.WriteText("invalid ssh host\r\n")
+			return
+		}
 		if spec.Port > 0 && spec.Port != 22 {
 			sshArgs = append(sshArgs, "-p", strconv.Itoa(spec.Port))
 		}
@@ -1765,7 +2022,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		if spec.User != "" {
 			dest = spec.User + "@" + dest
 		}
-		sshArgs = append(sshArgs, dest)
+		sshArgs = append(sshArgs, "--", dest)
 	}
 
 	var cmd *exec.Cmd
@@ -1781,6 +2038,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	if cmd == nil {
 		cmd = exec.Command("ssh", sshArgs...)
 	}
+	cmd.Env = withTermEnv(os.Environ())
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -1991,23 +2249,73 @@ func (s *Server) sendESP32Wake(relay *esp32WakeRelay, mac, broadcastIP string, p
 func spliceConns(a, b net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() {
+	copyOne := func(dst, src net.Conn) {
 		defer wg.Done()
-		_, _ = io.Copy(a, b)
-		if tc, ok := a.(interface{ CloseWrite() error }); ok {
+		_, _ = io.Copy(dst, src)
+		if tc, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = tc.CloseWrite()
+		} else {
+			_ = dst.Close()
 		}
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(b, a)
-		if tc, ok := b.(interface{ CloseWrite() error }); ok {
-			_ = tc.CloseWrite()
-		}
-	}()
+	}
+	go copyOne(a, b)
+	go copyOne(b, a)
 	wg.Wait()
 	_ = a.Close()
 	_ = b.Close()
+}
+
+func sameHostOriginCheck(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+func isSafeSSHToken(tok string) bool {
+	if tok == "" || strings.HasPrefix(tok, "-") || len(tok) > 255 {
+		return false
+	}
+	for i := 0; i < len(tok); i++ {
+		c := tok[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		switch {
+		case isAlphaNum:
+		case c == '.', c == '_', c == '-', c == ':', c == '[', c == ']', c == '%':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func withTermEnv(base []string) []string {
+	set := func(env []string, key, val string) []string {
+		prefix := key + "="
+		out := make([]string, 0, len(env)+1)
+		seen := false
+		for _, entry := range env {
+			if strings.HasPrefix(entry, prefix) {
+				if !seen {
+					out = append(out, prefix+val)
+					seen = true
+				}
+				continue
+			}
+			out = append(out, entry)
+		}
+		if !seen {
+			out = append(out, prefix+val)
+		}
+		return out
+	}
+	env := set(base, "TERM", "xterm-256color")
+	return set(env, "COLORTERM", "truecolor")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

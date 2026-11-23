@@ -79,7 +79,7 @@ func (r *WakeRelayRegistry) saveLocked() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(r.path, append(b, '\n'), 0600)
+	_ = writeFileAtomic(r.path, append(b, '\n'), 0600)
 }
 
 func (r *WakeRelayRegistry) Create(name string) (*WakeRelayRecord, string, error) {

@@ -26,6 +26,8 @@ import (
 	"ssh-fleet/internal/keyring"
 	"ssh-fleet/internal/power"
 	"ssh-fleet/internal/protocol"
+	"ssh-fleet/internal/updater"
+	"ssh-fleet/internal/version"
 	"ssh-fleet/internal/wol"
 	"ssh-fleet/internal/ws"
 )
@@ -1796,5 +1798,320 @@ func TestRenameAndDeleteNodeAndRevokeCred(t *testing.T) {
 	_ = revResp.Body.Close()
 	if revResp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for revoked node token, got %d", revResp.StatusCode)
+	}
+}
+
+func TestRemoteSelfUpdateAndTerminalColorEnv(t *testing.T) {
+	const adminTok = "admin-update-term-token"
+	srv, err := NewServer(adminTok, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewServer err: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Create join token as admin.
+	jtReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/join-tokens", strings.NewReader(`{}`))
+	jtReq.Header.Set("Authorization", "Bearer "+adminTok)
+	jtReq.Header.Set("Content-Type", "application/json")
+	jtResp, err := http.DefaultClient.Do(jtReq)
+	if err != nil {
+		t.Fatalf("POST /api/v1/join-tokens err: %v", err)
+	}
+	jtRaw, _ := io.ReadAll(jtResp.Body)
+	_ = jtResp.Body.Close()
+	if jtResp.StatusCode != http.StatusCreated && jtResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/join-tokens status %d: %s", jtResp.StatusCode, string(jtRaw))
+	}
+	var jtMap map[string]any
+	if err := json.Unmarshal(jtRaw, &jtMap); err != nil {
+		t.Fatalf("decode join-tokens err: %v (%s)", err, string(jtRaw))
+	}
+	joinToken, _ := jtMap["join_token"].(string)
+	if joinToken == "" {
+		joinToken, _ = jtMap["token"].(string)
+	}
+	if joinToken == "" {
+		t.Fatalf("missing join token in response: %s", string(jtRaw))
+	}
+
+	// Exchange join token for a scoped node token.
+	exBody, _ := json.Marshal(map[string]string{
+		"join_token": joinToken,
+		"node_id":    "term-update-node",
+	})
+	exResp, err := http.Post(ts.URL+"/api/v1/join/exchange", "application/json", bytes.NewReader(exBody))
+	if err != nil {
+		t.Fatalf("POST /api/v1/join/exchange err: %v", err)
+	}
+	exRaw, _ := io.ReadAll(exResp.Body)
+	_ = exResp.Body.Close()
+	if exResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/join/exchange status %d: %s", exResp.StatusCode, string(exRaw))
+	}
+	var exMap map[string]any
+	if err := json.Unmarshal(exRaw, &exMap); err != nil {
+		t.Fatalf("decode join/exchange err: %v (%s)", err, string(exRaw))
+	}
+	nodeTok, _ := exMap["node_token"].(string)
+	if nodeTok == "" {
+		nodeTok, _ = exMap["token"].(string)
+	}
+	if !strings.HasPrefix(nodeTok, "sfn_") {
+		t.Fatalf("expected sfn_ node token, got %q (%s)", nodeTok, string(exRaw))
+	}
+
+	updatedCh := make(chan string, 1)
+	client, err := agent.NewClient(agent.Options{
+		HubURL:       ts.URL,
+		Token:        nodeTok,
+		NodeID:       "term-update-node",
+		Name:         "Term Update Node",
+		PingInterval: time.Second,
+		UpdateFn: func(ctx context.Context) (updater.Result, error) {
+			return updater.Result{
+				CurrentVersion: "v1.1.0",
+				LatestVersion:  "v1.2.0",
+				Updated:        true,
+				BinaryPath:     "/tmp/mock-sf",
+			}, nil
+		},
+		OnUpdated: func(ver string) {
+			select {
+			case updatedCh <- ver:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("agent.NewClient err: %v", err)
+	}
+
+	agentCtx, agentCancel := context.WithCancel(context.Background())
+	defer agentCancel()
+	agentDone := make(chan error, 1)
+	go func() {
+		agentDone <- client.Run(agentCtx)
+	}()
+	defer func() {
+		agentCancel()
+		select {
+		case <-agentDone:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+
+	// Wait until node appears online with hub_version and node version reported.
+	var listResp struct {
+		OK         bool                `json:"ok"`
+		HubVersion string              `json:"hub_version"`
+		Nodes      []protocol.NodeInfo `json:"nodes"`
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	connected := false
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/nodes", nil)
+		req.Header.Set("Authorization", "Bearer "+adminTok)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_ = json.NewDecoder(resp.Body).Decode(&listResp)
+			_ = resp.Body.Close()
+			for _, n := range listResp.Nodes {
+				if n.NodeID == "term-update-node" && n.Online {
+					if listResp.HubVersion != version.Version {
+						t.Fatalf("expected hub_version %q, got %q", version.Version, listResp.HubVersion)
+					}
+					if n.Version != version.Version {
+						t.Fatalf("expected node version %q, got %q", version.Version, n.Version)
+					}
+					connected = true
+					break
+				}
+			}
+		}
+		if connected {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !connected {
+		t.Fatalf("agent did not connect in time")
+	}
+
+	// Node token must be forbidden from triggering remote self-update.
+	forbReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/term-update-node/update", nil)
+	forbReq.Header.Set("Authorization", "Bearer "+nodeTok)
+	forbResp, err := http.DefaultClient.Do(forbReq)
+	if err != nil {
+		t.Fatalf("node-token update request err: %v", err)
+	}
+	_ = forbResp.Body.Close()
+	if forbResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for node token on /update, got %d", forbResp.StatusCode)
+	}
+
+	// Admin token must trigger remote self-update and receive result + OnUpdated callback.
+	updReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/nodes/term-update-node/update", nil)
+	updReq.Header.Set("Authorization", "Bearer "+adminTok)
+	updResp, err := http.DefaultClient.Do(updReq)
+	if err != nil {
+		t.Fatalf("admin update request err: %v", err)
+	}
+	updRaw, _ := io.ReadAll(updResp.Body)
+	_ = updResp.Body.Close()
+	if updResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on /update, got %d: %s", updResp.StatusCode, string(updRaw))
+	}
+	var updJSON struct {
+		OK      bool   `json:"ok"`
+		NodeID  string `json:"node_id"`
+		Updated bool   `json:"updated"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(updRaw, &updJSON); err != nil {
+		t.Fatalf("decode update response err: %v (%s)", err, string(updRaw))
+	}
+	if !updJSON.OK || updJSON.NodeID != "term-update-node" || !updJSON.Updated || updJSON.Version != "v1.2.0" {
+		t.Fatalf("unexpected update response: %+v", updJSON)
+	}
+	select {
+	case gotPath := <-updatedCh:
+		if gotPath != "/tmp/mock-sf" {
+			t.Fatalf("expected OnUpdated(\"/tmp/mock-sf\"), got %q", gotPath)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("OnUpdated callback did not fire")
+	}
+
+	// Open WebSocket terminal session in agent mode with explicit cols=100 & rows=30.
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("parse test server url err: %v", err)
+	}
+	conn, err := net.DialTimeout("tcp", u.Host, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial test server err: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	wsReq := fmt.Sprintf(
+		"GET /api/v1/ws/terminal?mode=agent&node_id=term-update-node&cols=100&rows=30 HTTP/1.1\r\n"+
+			"Host: %s\r\n"+
+			"Authorization: Bearer %s\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Sec-WebSocket-Version: 13\r\n"+
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+		u.Host, adminTok,
+	)
+	if _, err := io.WriteString(conn, wsReq); err != nil {
+		t.Fatalf("write ws upgrade err: %v", err)
+	}
+
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read ws status err: %v", err)
+	}
+	if !strings.Contains(statusLine, "101") {
+		t.Fatalf("expected 101 Switching Protocols, got %q", statusLine)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read ws header err: %v", err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	writeMaskedWSFrame := func(op byte, payload []byte) error {
+		mask := [4]byte{0x12, 0x34, 0x56, 0x78}
+		var hdr []byte
+		hdr = append(hdr, 0x80|op)
+		switch {
+		case len(payload) < 126:
+			hdr = append(hdr, 0x80|byte(len(payload)))
+		case len(payload) <= 0xffff:
+			hdr = append(hdr, 0x80|126, byte(len(payload)>>8), byte(len(payload)))
+		default:
+			return fmt.Errorf("payload too large for test helper: %d", len(payload))
+		}
+		hdr = append(hdr, mask[:]...)
+		masked := make([]byte, len(payload))
+		for i, b := range payload {
+			masked[i] = b ^ mask[i%4]
+		}
+		if _, err := conn.Write(hdr); err != nil {
+			return err
+		}
+		_, err := conn.Write(masked)
+		return err
+	}
+
+	cmdStr := "printf '%s|%s\\n' \"$TERM\" \"$COLORTERM\"; stty size; exit\n"
+	if err := writeMaskedWSFrame(0x1, []byte(cmdStr)); err != nil {
+		t.Fatalf("write terminal cmd frame err: %v", err)
+	}
+
+	var out bytes.Buffer
+	_ = conn.SetReadDeadline(time.Now().Add(6 * time.Second))
+	for {
+		var hdr [2]byte
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			break
+		}
+		op := hdr[0] & 0x0f
+		masked := (hdr[1] & 0x80) != 0
+		plen := uint64(hdr[1] & 0x7f)
+		switch plen {
+		case 126:
+			var ext [2]byte
+			if _, err := io.ReadFull(br, ext[:]); err != nil {
+				t.Fatalf("read ws ext16 err: %v", err)
+			}
+			plen = uint64(binary.BigEndian.Uint16(ext[:]))
+		case 127:
+			var ext [8]byte
+			if _, err := io.ReadFull(br, ext[:]); err != nil {
+				t.Fatalf("read ws ext64 err: %v", err)
+			}
+			plen = binary.BigEndian.Uint64(ext[:])
+		}
+		var maskKey [4]byte
+		if masked {
+			if _, err := io.ReadFull(br, maskKey[:]); err != nil {
+				t.Fatalf("read ws mask err: %v", err)
+			}
+		}
+		payload := make([]byte, plen)
+		if _, err := io.ReadFull(br, payload); err != nil {
+			break
+		}
+		if masked {
+			for i := range payload {
+				payload[i] ^= maskKey[i%4]
+			}
+		}
+		if op == 0x8 {
+			break
+		}
+		if op == 0x1 || op == 0x2 || op == 0x0 {
+			out.Write(payload)
+			s := out.String()
+			if strings.Contains(s, "xterm-256color|truecolor") && strings.Contains(s, "30 100") {
+				break
+			}
+		}
+	}
+	_ = writeMaskedWSFrame(0x8, nil)
+
+	gotOut := out.String()
+	if !strings.Contains(gotOut, "xterm-256color|truecolor") {
+		t.Fatalf("expected terminal output to contain xterm-256color|truecolor, got:\n%s", gotOut)
+	}
+	if !strings.Contains(gotOut, "30 100") {
+		t.Fatalf("expected terminal output to contain initial stty size '30 100', got:\n%s", gotOut)
 	}
 }

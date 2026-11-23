@@ -145,7 +145,7 @@ func (s *NodeCredStore) saveLocked() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(s.path, append(b, '\n'), 0600)
+	_ = writeFileAtomic(s.path, append(b, '\n'), 0600)
 }
 
 func (s *NodeCredStore) Issue(nodeID string) string {

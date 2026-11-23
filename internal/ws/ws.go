@@ -14,15 +14,35 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	wsGUID       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	maxChunkSize = 32768
+	wsGUID          = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	maxChunkSize    = 32768
+	maxMessageBytes = 8 * 1024 * 1024
 )
+
+// UpgradeOptions configures server-side WebSocket handshake validation.
+type UpgradeOptions struct {
+	CheckOrigin func(r *http.Request) bool
+}
+
+// UpgradeError reports a non-101 HTTP response during a WebSocket client handshake.
+type UpgradeError struct {
+	StatusCode int
+	StatusLine string
+}
+
+func (e *UpgradeError) Error() string {
+	if e.StatusLine != "" {
+		return fmt.Sprintf("websocket upgrade failed: %s", e.StatusLine)
+	}
+	return fmt.Sprintf("websocket upgrade failed: HTTP %d", e.StatusCode)
+}
 
 // Conn implements net.Conn over an RFC 6455 WebSocket connection.
 type Conn struct {
@@ -33,12 +53,22 @@ type Conn struct {
 	readM   sync.Mutex
 	pending []byte
 
-	writeM sync.Mutex
-	closed bool
+	writeM        sync.Mutex
+	writeDeadline time.Time
+	closed        bool
 }
 
 // UpgradeServer performs the server-side RFC 6455 WebSocket handshake.
 func UpgradeServer(w http.ResponseWriter, r *http.Request) (*Conn, error) {
+	return UpgradeServerWithOptions(w, r, UpgradeOptions{})
+}
+
+// UpgradeServerWithOptions performs the server-side RFC 6455 WebSocket handshake with custom checks.
+func UpgradeServerWithOptions(w http.ResponseWriter, r *http.Request, opts UpgradeOptions) (*Conn, error) {
+	if opts.CheckOrigin != nil && !opts.CheckOrigin(r) {
+		http.Error(w, "forbidden origin", http.StatusForbidden)
+		return nil, errors.New("forbidden websocket origin")
+	}
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		http.Error(w, "expected websocket upgrade", http.StatusBadRequest)
 		return nil, errors.New("not a websocket upgrade request")
@@ -83,21 +113,46 @@ func UpgradeServer(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	}, nil
 }
 
+func hasCRLFOrNul(s string) bool {
+	return strings.ContainsAny(s, "\r\n\x00")
+}
+
 // DialClient connects via TCP/TLS and upgrades to an RFC 6455 WebSocket with Bearer auth and optional headers.
 func DialClient(ctx context.Context, baseURL, pathWithQuery, token string, extraHeaders map[string]string) (*Conn, error) {
+	if hasCRLFOrNul(pathWithQuery) || hasCRLFOrNul(token) {
+		return nil, errors.New("websocket request contains invalid control characters")
+	}
+
 	u, err := url.Parse(strings.TrimRight(baseURL, "/"))
 	if err != nil {
 		return nil, err
 	}
 
+	hostname := u.Hostname()
+	if hostname == "" {
+		return nil, errors.New("websocket URL host is required")
+	}
+
 	scheme := strings.ToLower(u.Scheme)
-	host := u.Host
-	if !strings.Contains(host, ":") {
+	port := u.Port()
+	if port == "" {
 		if scheme == "https" || scheme == "wss" {
-			host += ":443"
+			port = "443"
 		} else {
-			host += ":80"
+			port = "80"
 		}
+	}
+	targetAddr := net.JoinHostPort(hostname, port)
+
+	var headerBuf strings.Builder
+	for k, v := range extraHeaders {
+		if strings.TrimSpace(v) == "" {
+			continue
+		}
+		if hasCRLFOrNul(k) || hasCRLFOrNul(v) || strings.Contains(k, ":") {
+			return nil, fmt.Errorf("invalid websocket header %q", k)
+		}
+		headerBuf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 	}
 
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
@@ -105,14 +160,35 @@ func DialClient(ctx context.Context, baseURL, pathWithQuery, token string, extra
 	if scheme == "https" || scheme == "wss" {
 		tlsDialer := &tls.Dialer{
 			NetDialer: dialer,
-			Config:    &tls.Config{ServerName: u.Hostname()},
+			Config:    &tls.Config{ServerName: hostname, MinVersion: tls.VersionTLS12},
 		}
-		conn, err = tlsDialer.DialContext(ctx, "tcp", host)
+		conn, err = tlsDialer.DialContext(ctx, "tcp", targetAddr)
 	} else {
-		conn, err = dialer.DialContext(ctx, "tcp", host)
+		conn, err = dialer.DialContext(ctx, "tcp", targetAddr)
 	}
 	if err != nil {
 		return nil, err
+	}
+
+	handshakeDeadline := time.Now().Add(10 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(handshakeDeadline) {
+		handshakeDeadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(handshakeDeadline)
+
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopWatch:
+		}
+	}()
+	finishHandshakeWatch := func() {
+		close(stopWatch)
+		<-watchDone
 	}
 
 	keyRaw := make([]byte, 16)
@@ -125,12 +201,8 @@ func DialClient(ctx context.Context, baseURL, pathWithQuery, token string, extra
 
 	basePath := strings.TrimRight(u.Path, "/")
 	reqTarget := basePath + pathWithQuery
-
-	var headerBuf strings.Builder
-	for k, v := range extraHeaders {
-		if strings.TrimSpace(v) != "" {
-			headerBuf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
-		}
+	if reqTarget == "" {
+		reqTarget = "/"
 	}
 
 	reqStr := fmt.Sprintf(
@@ -142,6 +214,7 @@ func DialClient(ctx context.Context, baseURL, pathWithQuery, token string, extra
 		headerBuf.String(),
 	)
 	if _, err := conn.Write([]byte(reqStr)); err != nil {
+		finishHandshakeWatch()
 		_ = conn.Close()
 		return nil, err
 	}
@@ -149,18 +222,29 @@ func DialClient(ctx context.Context, baseURL, pathWithQuery, token string, extra
 	br := bufio.NewReader(conn)
 	statusLine, err := br.ReadString('\n')
 	if err != nil {
+		finishHandshakeWatch()
 		_ = conn.Close()
 		return nil, err
 	}
-	if !strings.Contains(statusLine, "101") {
+
+	statusCode := 0
+	if fields := strings.Fields(statusLine); len(fields) >= 2 && strings.HasPrefix(strings.ToUpper(fields[0]), "HTTP/") {
+		statusCode, _ = strconv.Atoi(fields[1])
+	}
+	if statusCode != http.StatusSwitchingProtocols {
+		finishHandshakeWatch()
 		_ = conn.Close()
-		return nil, fmt.Errorf("websocket upgrade failed: %s", strings.TrimSpace(statusLine))
+		return nil, &UpgradeError{
+			StatusCode: statusCode,
+			StatusLine: strings.TrimSpace(statusLine),
+		}
 	}
 
 	gotAccept := ""
-	for {
+	for lineCount := 0; lineCount < 256; lineCount++ {
 		line, err := br.ReadString('\n')
 		if err != nil {
+			finishHandshakeWatch()
 			_ = conn.Close()
 			return nil, err
 		}
@@ -173,11 +257,24 @@ func DialClient(ctx context.Context, baseURL, pathWithQuery, token string, extra
 				gotAccept = strings.TrimSpace(line[idx+1:])
 			}
 		}
+		if lineCount == 255 {
+			finishHandshakeWatch()
+			_ = conn.Close()
+			return nil, errors.New("websocket upgrade response headers exceeded limit")
+		}
 	}
-	if gotAccept != "" && gotAccept != wantAccept {
+	if gotAccept == "" || gotAccept != wantAccept {
+		finishHandshakeWatch()
 		_ = conn.Close()
-		return nil, errors.New("websocket Sec-WebSocket-Accept mismatch")
+		return nil, errors.New("websocket Sec-WebSocket-Accept missing or mismatch")
 	}
+
+	finishHandshakeWatch()
+	if ctx.Err() != nil {
+		_ = conn.Close()
+		return nil, ctx.Err()
+	}
+	_ = conn.SetDeadline(time.Time{})
 
 	return &Conn{
 		raw:      conn,
@@ -193,11 +290,15 @@ func (c *Conn) ReadMessage() (byte, []byte, error) {
 }
 
 func (c *Conn) readMessageLocked() (byte, []byte, error) {
+	var fragOpcode byte
+	var fragBuf []byte
+
 	for {
 		var hdr [2]byte
 		if _, err := io.ReadFull(c.r, hdr[:]); err != nil {
 			return 0, nil, err
 		}
+		fin := (hdr[0] & 0x80) != 0
 		opcode := hdr[0] & 0x0F
 		masked := (hdr[1] & 0x80) != 0
 		payloadLen := uint64(hdr[1] & 0x7F)
@@ -216,8 +317,13 @@ func (c *Conn) readMessageLocked() (byte, []byte, error) {
 			payloadLen = binary.BigEndian.Uint64(ext[:])
 		}
 
-		if payloadLen > 8*1024*1024 {
+		if payloadLen > maxMessageBytes {
 			return 0, nil, errors.New("websocket frame too large")
+		}
+
+		if !c.isClient && !masked {
+			_ = c.writeControlFrame(0x8, []byte{0x03, 0xEA})
+			return 0, nil, errors.New("websocket client frame must be masked")
 		}
 
 		var maskKey [4]byte
@@ -239,18 +345,56 @@ func (c *Conn) readMessageLocked() (byte, []byte, error) {
 			}
 		}
 
-		switch opcode {
-		case 0x8: // Close
-			_ = c.writeFrame(0x8, nil)
-			return opcode, payload, io.EOF
-		case 0x9: // Ping
-			_ = c.writeFrame(0xA, payload)
+		if opcode >= 0x8 {
+			if !fin || payloadLen > 125 {
+				_ = c.writeControlFrame(0x8, []byte{0x03, 0xEA})
+				return 0, nil, errors.New("invalid websocket control frame")
+			}
+			switch opcode {
+			case 0x8: // Close
+				_ = c.writeControlFrame(0x8, nil)
+				return opcode, payload, io.EOF
+			case 0x9: // Ping
+				_ = c.writeControlFrame(0xA, payload)
+				continue
+			case 0xA: // Pong
+				continue
+			default:
+				_ = c.writeControlFrame(0x8, []byte{0x03, 0xEA})
+				return 0, nil, fmt.Errorf("unsupported websocket control opcode: 0x%x", opcode)
+			}
+		}
+
+		if opcode == 0x0 {
+			if fragOpcode == 0 {
+				_ = c.writeControlFrame(0x8, []byte{0x03, 0xEA})
+				return 0, nil, errors.New("unexpected websocket continuation frame")
+			}
+			if uint64(len(fragBuf))+payloadLen > maxMessageBytes {
+				return 0, nil, errors.New("websocket fragmented message too large")
+			}
+			fragBuf = append(fragBuf, payload...)
+			if fin {
+				return fragOpcode, fragBuf, nil
+			}
 			continue
-		case 0xA: // Pong
-			continue
-		default:
+		}
+
+		if opcode != 0x1 && opcode != 0x2 {
+			_ = c.writeControlFrame(0x8, []byte{0x03, 0xEA})
+			return 0, nil, fmt.Errorf("unsupported websocket opcode: 0x%x", opcode)
+		}
+
+		if fragOpcode != 0 {
+			_ = c.writeControlFrame(0x8, []byte{0x03, 0xEA})
+			return 0, nil, errors.New("unexpected non-continuation data frame during fragmented message")
+		}
+
+		if fin {
 			return opcode, payload, nil
 		}
+		fragOpcode = opcode
+		fragBuf = payload
 	}
 }
 
@@ -309,7 +453,22 @@ func (c *Conn) writeFrame(opcode byte, payload []byte) error {
 	if c.closed {
 		return net.ErrClosed
 	}
+	return c.writeFrameLocked(opcode, payload)
+}
 
+func (c *Conn) writeControlFrame(opcode byte, payload []byte) error {
+	c.writeM.Lock()
+	defer c.writeM.Unlock()
+	if c.closed {
+		return net.ErrClosed
+	}
+	_ = c.raw.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	err := c.writeFrameLocked(opcode, payload)
+	_ = c.raw.SetWriteDeadline(c.writeDeadline)
+	return err
+}
+
+func (c *Conn) writeFrameLocked(opcode byte, payload []byte) error {
 	n := len(payload)
 	var maskBit byte
 	if c.isClient {
@@ -365,13 +524,26 @@ func (c *Conn) Close() error {
 	c.writeM.Lock()
 	if !c.closed {
 		c.closed = true
+		_ = c.raw.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
+		_ = c.writeFrameLocked(0x8, nil)
+		_ = c.raw.SetWriteDeadline(c.writeDeadline)
 	}
 	c.writeM.Unlock()
 	return c.raw.Close()
 }
 
-func (c *Conn) LocalAddr() net.Addr                { return c.raw.LocalAddr() }
-func (c *Conn) RemoteAddr() net.Addr               { return c.raw.RemoteAddr() }
-func (c *Conn) SetDeadline(t time.Time) error      { return c.raw.SetDeadline(t) }
-func (c *Conn) SetReadDeadline(t time.Time) error  { return c.raw.SetReadDeadline(t) }
-func (c *Conn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }
+func (c *Conn) LocalAddr() net.Addr               { return c.raw.LocalAddr() }
+func (c *Conn) RemoteAddr() net.Addr              { return c.raw.RemoteAddr() }
+func (c *Conn) SetReadDeadline(t time.Time) error { return c.raw.SetReadDeadline(t) }
+func (c *Conn) SetDeadline(t time.Time) error {
+	c.writeM.Lock()
+	c.writeDeadline = t
+	c.writeM.Unlock()
+	return c.raw.SetDeadline(t)
+}
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	c.writeM.Lock()
+	c.writeDeadline = t
+	c.writeM.Unlock()
+	return c.raw.SetWriteDeadline(t)
+}

@@ -19,6 +19,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,7 +27,9 @@ import (
 	"ssh-fleet/internal/hub"
 	"ssh-fleet/internal/protocol"
 	"ssh-fleet/internal/ui"
+	"ssh-fleet/internal/updater"
 	"ssh-fleet/internal/vault"
+	"ssh-fleet/internal/version"
 	"ssh-fleet/internal/wol"
 )
 
@@ -46,6 +49,11 @@ func run(args []string) error {
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
+	case "version", "--version", "-v":
+		fmt.Printf("sf %s (%s/%s)\n", version.Version, runtime.GOOS, runtime.GOARCH)
+		return nil
+	case "update":
+		return cmdUpdate(args[1:])
 	case "find":
 		return cmdFind(args[1:])
 	case "list", "ls":
@@ -117,7 +125,67 @@ RELAY HUB & DEVICE AGENT:
   sf hub [--listen :8090] [--token T] [--install-service]
   sf join <hub-url> <token> [--name NAME] [--no-agent]
   sf agent [--hub URL] [--token T] [--name NAME] [--ssh-port 22] [--install-service]
+  sf update [--force]               Download latest release from GitHub and restart services
+  sf version                        Print current sf build version
   sf proxy <node-id>                Internal OpenSSH ProxyCommand over Hub tunnel`)
+}
+
+func cmdUpdate(args []string) error {
+	fs := flag.NewFlagSet("update", flag.ContinueOnError)
+	force := fs.Bool("force", false, "Reinstall latest release even if version matches or is dev")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	res, err := updater.CheckAndApply(ctx, updater.Options{
+		CurrentVersion:  version.Version,
+		Force:           *force,
+		RequireChecksum: true,
+	})
+	if err != nil {
+		return err
+	}
+	if !res.Updated {
+		fmt.Printf("Already up to date (%s, latest=%s)\n", res.CurrentVersion, res.LatestVersion)
+		return nil
+	}
+	fmt.Printf("Updated sf: %s -> %s (%s)\n", res.CurrentVersion, res.LatestVersion, res.BinaryPath)
+	restartActiveServices()
+	return nil
+}
+
+func restartActiveServices() {
+	switch runtime.GOOS {
+	case "linux":
+		for _, unit := range []string{"ssh-fleet-hub", "ssh-fleet-agent"} {
+			if exec.Command("systemctl", "--user", "is-active", "--quiet", unit).Run() == nil {
+				if err := exec.Command("systemctl", "--user", "restart", unit).Run(); err == nil {
+					fmt.Printf("Restarted systemd user service: %s\n", unit)
+				}
+			}
+			if os.Geteuid() == 0 && exec.Command("systemctl", "is-active", "--quiet", unit).Run() == nil {
+				if err := exec.Command("systemctl", "restart", unit).Run(); err == nil {
+					fmt.Printf("Restarted systemd service: %s\n", unit)
+				}
+			}
+		}
+	case "darwin":
+		home, _ := os.UserHomeDir()
+		plist := filepath.Join(home, "Library", "LaunchAgents", "com.sshfleet.agent.plist")
+		if _, err := os.Stat(plist); err == nil {
+			out, _ := exec.Command("launchctl", "list").Output()
+			if strings.Contains(string(out), "com.sshfleet.agent") {
+				target := fmt.Sprintf("gui/%d/com.sshfleet.agent", os.Getuid())
+				if exec.Command("launchctl", "kickstart", "-k", target).Run() != nil {
+					_ = exec.Command("launchctl", "unload", plist).Run()
+					_ = exec.Command("launchctl", "load", "-w", plist).Run()
+				}
+				fmt.Println("Restarted LaunchAgent: com.sshfleet.agent")
+			}
+		}
+	}
 }
 
 func configPath() string {
@@ -1135,6 +1203,7 @@ func cmdHub(args []string) error {
 	publicURL := fs.String("public-url", "", "Public URL of this Hub for join command output")
 	trustCF := fs.Bool("trust-cf-access", false, "Trust Cloudflare Access Zero Trust authenticated headers for Web UI & API")
 	cfEmail := fs.String("cf-access-email", os.Getenv("SF_CF_ACCESS_EMAIL"), "Comma-separated Cloudflare Access emails allowed (implies --trust-cf-access)")
+	autoUpdate := fs.Bool("auto-update", os.Getenv("SF_AUTO_UPDATE") != "0", "Automatically check GitHub Releases and restart when a newer version is available")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1170,8 +1239,37 @@ func cmdHub(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ssh-fleet Hub listening on %s (dataDir=%s, cfAccess=%v)\n", *listen, *dataDir, *trustCF || *cfEmail != "")
-	return srv.ListenAndServe(*listen)
+	fmt.Printf("ssh-fleet Hub listening on %s (version=%s, dataDir=%s, cfAccess=%v, autoUpdate=%v)\n",
+		*listen, version.Version, *dataDir, *trustCF || *cfEmail != "", *autoUpdate)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var restarting atomic.Bool
+	if *autoUpdate {
+		go updater.StartAutoLoop(ctx, version.Version, 30*time.Minute, 1*time.Minute, func() {
+			restarting.Store(true)
+			_ = srv.Close()
+			time.Sleep(150 * time.Millisecond)
+		})
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe(*listen)
+	}()
+
+	select {
+	case err := <-errCh:
+		if restarting.Load() {
+			time.Sleep(5 * time.Second)
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		_ = srv.Close()
+		return nil
+	}
 }
 
 func installAndStartHub(listen, token, dataDir, publicURL string, trustCF bool, cfEmail string) error {
@@ -1558,6 +1656,7 @@ func cmdAgent(args []string) error {
 	name := fs.String("name", cfg.AgentName, "Display name")
 	sshPort := fs.Int("ssh-port", cfg.SSHPort, "Local SSH server port")
 	installSvc := fs.Bool("install-service", false, "Install OS background service (systemd / LaunchAgent / Windows Startup)")
+	autoUpdate := fs.Bool("auto-update", os.Getenv("SF_AUTO_UPDATE") != "0", "Automatically check GitHub Releases and restart when a newer version is available")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1608,8 +1707,27 @@ func cmdAgent(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	fmt.Printf("ssh-fleet Agent starting (node=%s, hub=%s, sshPort=%d)\n", *nodeID, *hubURL, *sshPort)
-	return client.Run(ctx)
+
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
+	var restarting atomic.Bool
+	if *autoUpdate {
+		go updater.StartAutoLoop(runCtx, version.Version, 30*time.Minute, 1*time.Minute, func() {
+			restarting.Store(true)
+			cancelRun()
+			time.Sleep(150 * time.Millisecond)
+		})
+	}
+
+	fmt.Printf("ssh-fleet Agent starting (version=%s, node=%s, hub=%s, sshPort=%d, autoUpdate=%v)\n",
+		version.Version, *nodeID, *hubURL, *sshPort, *autoUpdate)
+	err = client.Run(runCtx)
+	if restarting.Load() {
+		time.Sleep(5 * time.Second)
+		return nil
+	}
+	return err
 }
 
 func cmdProxy(args []string) error {
