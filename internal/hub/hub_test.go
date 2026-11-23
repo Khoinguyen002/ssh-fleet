@@ -131,6 +131,7 @@ func TestHubEndToEndProxyPowerWoLAndVaultSync(t *testing.T) {
 	}()
 
 	// 2. Connect laptop-1 and home-pc-relay on the same simulated LAN subnet 192.168.10.0/24.
+	notVPS := false
 	laptopExec := &fakePowerExec{hardSleepCh: make(chan struct{})}
 	laptopPower := power.NewManager(laptopExec)
 	laptopAgent, err := agent.NewClient(agent.Options{
@@ -138,6 +139,7 @@ func TestHubEndToEndProxyPowerWoLAndVaultSync(t *testing.T) {
 		Token:   token,
 		NodeID:  "laptop-1",
 		Name:    "laptop-1",
+		IsVPS:   &notVPS,
 		SSHPort: sshdPort,
 		SSHUser: "khoi",
 		Power:   laptopPower,
@@ -170,6 +172,7 @@ func TestHubEndToEndProxyPowerWoLAndVaultSync(t *testing.T) {
 		Token:   token,
 		NodeID:  "home-pc-relay",
 		Name:    "home-pc-relay",
+		IsVPS:   &notVPS,
 		SSHPort: 22,
 		SSHUser: "relay",
 		WoLHandler: func(mac, broadcastIP string) error {
@@ -1808,7 +1811,10 @@ func TestRemoteSelfUpdateAndTerminalColorEnv(t *testing.T) {
 		t.Fatalf("NewServer err: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
+	defer func() {
+		_ = srv.Close()
+		ts.Close()
+	}()
 
 	// Create join token as admin.
 	jtReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/join-tokens", strings.NewReader(`{}`))
@@ -1899,6 +1905,7 @@ func TestRemoteSelfUpdateAndTerminalColorEnv(t *testing.T) {
 		case <-agentDone:
 		case <-time.After(2 * time.Second):
 		}
+		waitForNodeOnline(t, srv, "term-update-node", false, 2*time.Second)
 	}()
 
 	// Wait until node appears online with hub_version and node version reported.
